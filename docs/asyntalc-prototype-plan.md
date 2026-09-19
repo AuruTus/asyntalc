@@ -1,6 +1,6 @@
 # Asyntalc prototype plan
 
-Status: Milestones 1–2 implemented; live-provider validation pending. Version 0.1.1, updated 2026-09-19.
+Status: Milestones 1–2 implemented; one-request live DeepSeek validation passed. Version 0.1.1, updated 2026-09-19.
 Based on [the v0.1 design](asyntalc-design-v0.1.md).
 Provider decision: an OpenAI-compatible Chat Completions API, with configurable endpoint and model.
 
@@ -485,7 +485,7 @@ The roughly three-second intervals reflect the configured fake delay, not an LLM
 
 ## 12. Milestone 2: real chat requests and session history
 
-Version 0.1.1 adds the text-only Chat Completions adapter and successful-turn replay. It retains the same client commands and JSON version. The release is locally validated against a fake HTTP server; its live acceptance check is explicitly pending the user's temporary DeepSeek credential.
+Version 0.1.1 adds the text-only Chat Completions adapter and successful-turn replay. It retains the same client commands and JSON version. The release is locally validated against a fake HTTP server, and the opt-in one-request DeepSeek smoke test passed on 2026-09-19.
 
 ```mermaid
 flowchart LR
@@ -513,7 +513,7 @@ flowchart LR
 
 ### DeepSeek setup and live validation
 
-The user selected `https://api.deepseek.com` as the first live endpoint and will export a temporary key in a later session. The prepared [DeepSeek profile](../examples/deepseek.toml) uses `deepseek-flash`, system instructions, `max_tokens`, and `reasoning_effort = "none"`. These settings follow the current [DeepSeek API reference](https://api-docs.deepseek.com/api/create-chat-completion/); actual account access and live compatibility have not been verified.
+The user selected `https://api.deepseek.com` as the first live endpoint and supplied a temporary key through the process environment. The [DeepSeek profile](../examples/deepseek.toml) uses `deepseek-flash`, system instructions, `max_tokens`, and `reasoning_effort = "none"`. These settings follow the current [DeepSeek API reference](https://api-docs.deepseek.com/api/create-chat-completion/). The smoke test verified access and the basic request/result path for that account and configuration; it is not an exhaustive provider compatibility check.
 
 After making `DEEPSEEK_API_KEY` available to the daemon's environment:
 
@@ -542,7 +542,7 @@ export ASYNTALC_LIVE_CONFIG="$PWD/examples/deepseek.toml"
 cargo test --locked --test client_daemon chat_provider::live_chat_smoke -- --ignored --exact
 ```
 
-The live check is ignored in normal test runs and must remain recorded as pending until it is actually executed with the user's key. Do not substitute the fake-server result for live evidence.
+The live check remains ignored in normal test runs. It was explicitly executed with the user's exported key: **1 passed, 0 failed**, with the expected final text `asyntalc smoke ok` retrieved by the CLI. The reported test duration was 0.64 seconds for this single run, not a latency benchmark. The key was neither printed nor placed in configuration, and the temporary test database was removed by the harness. Multi-turn history correctness was checked locally; a live multi-turn test has not been run.
 
 ### Local validation and remaining work
 
@@ -550,4 +550,6 @@ The local HTTP tests gate responses to inspect exact requests while a run is act
 
 The baseline remains the eight milestone 1 tests; the added provider tests exercise the same lifecycle through HTTP. The version 0.1.1 local suite reports **18 passed, 0 failed, and 1 ignored live test**; formatting and Clippy checks pass with Rust 1.98.1. This is functional validation, not a throughput benchmark or model-quality comparison. Full results and resumption instructions are recorded in the [milestone 2 handoff](../knowledge-base/milestone-2-chat-provider.md).
 
-Still outstanding for the first useful v0.1 slice: independent-session concurrency, explicit cancellation, durable deadlines, submission idempotency, parent clarification/resume, and run listing/log inspection. Tools and sandbox execution follow those lifecycle milestones. Finishing the DeepSeek smoke test is the next validation action before describing the provider integration as live-verified.
+Still outstanding for the first useful v0.1 slice: independent-session concurrency, explicit cancellation, durable deadlines, submission idempotency, parent clarification/resume, and run listing/log inspection. Tools and sandbox execution follow those lifecycle milestones. The basic DeepSeek integration is live-verified; concurrency and cancellation are the next implementation milestone.
+
+The checked-in DeepSeek profile now omits repeated defaults while preserving the effective settings used for validation. Only endpoint, model, and key-variable name are required; other entries are optional overrides. Configuration is trusted input because it selects the destination for both the credential and conversation. Neither configuration nor SQLite provides encryption, and private instructions should not be committed. See the [configuration safety discussion](../README.md#configuration-size-and-safety).

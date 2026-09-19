@@ -48,13 +48,23 @@ On daemon restart with the same configuration, completed results remain availabl
 
 The [example TOML](examples/provider.toml) lists all fields. `base_url` includes the provider's API prefix; the daemon appends `/chat/completions`. Configure `instruction_role` as `system` or `developer`, and `output_token_parameter` as `max_tokens` or `max_completion_tokens`, according to the endpoint/model. Requests use `stream: false` and the default single response choice. Optional `reasoning_effort` is sent only when configured. This is a text-only compatibility subset; tool calls fail explicitly.
 
-The user-selected first live provider is DeepSeek. [examples/deepseek.toml](examples/deepseek.toml) targets `https://api.deepseek.com` with `deepseek-flash`, `max_tokens`, and `reasoning_effort = "none"`, following the current [DeepSeek API reference](https://api-docs.deepseek.com/api/create-chat-completion/). The model choice is a configurable implementation default; the live test is pending the user's temporary key.
+The user-selected first live provider is DeepSeek. [examples/deepseek.toml](examples/deepseek.toml) targets `https://api.deepseek.com` with `deepseek-flash`, `max_tokens`, and `reasoning_effort = "none"`, following the current [DeepSeek API reference](https://api-docs.deepseek.com/api/create-chat-completion/). The model choice is configurable. The one-request live smoke test passed on 2026-09-19 using an environment-provided credential.
 
 The daemon reads the named key environment variable at startup. It keeps the credential in memory, uses it as a bearer header, and stores only the non-secret profile in SQLite. HTTP redirects and automatic retries are disabled. Configuration and provider error diagnostics omit raw source lines and response bodies.
 
 Each session retains its complete non-secret profile, including model, URL, instructions, limits, and key-variable name. A submission reusing that session under different settings fails with `session_config_conflict`. Start a new session to change settings. Restart with the original configuration to continue queued work; startup rejects mismatched queued profiles. Credential values can rotate without changing session identity, but require a daemon restart to reload.
 
 This release supports one configured profile per daemon, supplied explicitly with `--config`. It does not yet implement layered project/user configuration or per-submission model overrides. The local `provider.toml` is ignored by Git.
+
+### Configuration size and safety
+
+Only `base_url`, `model`, and `api_key_env` are required. Other fields override validated defaults, so a normal profile need not repeat every limit. The DeepSeek example retains only those three fields plus its instructions, reasoning setting, and output-token budget. Removing explicitly written default values does not change the effective profile stored in a session.
+
+Endpoints, model IDs, limits, and an environment-variable name are not credentials. Keep the actual key in the daemon's environment or a secret manager; do not place it in TOML, prompts, command arguments, or Git. The parser rejects a raw `api_key` field and credentials embedded in a URL, but it does not identify arbitrary secrets placed inside ordinary text fields.
+
+Treat provider configuration as trusted input: changing `base_url` changes where the daemon sends its bearer credential and conversation. Use HTTPS for a remote endpoint; HTTP is also accepted for local test servers. Do not load an unreviewed profile merely because it contains no key itself.
+
+System instructions may contain private information. Configuration files and SQLite are not encrypted. The daemon's data directory is private (0700), but the owning OS account and privileged processes can access it; an environment variable is not a vault against those processes. A private profile containing sensitive instructions should have restrictive permissions such as 0600 and stay out of Git. The profile, prompts, answers, and selected failure data persist in SQLite; the credential value does not enter those records through the authentication path.
 
 ## Output contract
 
@@ -135,6 +145,16 @@ cargo test --locked --test client_daemon chat_provider::live_chat_smoke -- --ign
 ```
 
 The live test uses a temporary data directory and removes it afterward. It is ignored by default. Local adapter tests are not a substitute for checking compatibility with your actual endpoint and model.
+
+Latest validation on Rust/Cargo 1.98.1: 18 local tests passed, and the separately selected live DeepSeek test passed. The locked all-target build and Clippy passed. No dependency version change was needed for these checks. A package's newer major release is not by itself evidence that the locked version is incompatible with the compiler.
+
+### rust-analyzer after a Rust upgrade
+
+An editor diagnostic on a derive macro such as `mismatched ABI expected: rustc 1.92.0, got: rustc 1.98.1` means the proc-macro host and compiled macro library use different compiler ABIs. This occurred on `serde_derive` in `src/protocol.rs` after the toolchain upgrade, while the locked Cargo build and tests passed. A fresh `rust-analyzer diagnostics . --severity error` scan also completed without errors.
+
+In VS Code, run **rust-analyzer: Restart server** from the command palette; if the diagnostic remains, run **Developer: Reload Window**. If it still persists, inspect any `rust-analyzer.server.path`, `rust-analyzer.procMacro.server`, or toolchain override in local/remote settings for an old toolchain. The installed rustup-managed analyzer can be checked with `rust-analyzer --version` and `rustup which rust-analyzer`. VS Code can use its extension-bundled analyzer rather than that executable, as described in the [official installation guide](https://rust-analyzer.github.io/book/installation.html).
+
+Restarting the editor-side host is the first remedy for this specific mismatch. Changing Serde versions, disabling macro diagnostics, or downgrading Rust is not justified by a passing Cargo build plus an old-host/new-library ABI diagnostic.
 
 For the prepared DeepSeek profile, export `DEEPSEEK_API_KEY` in the environment used to launch the next session, then run:
 
