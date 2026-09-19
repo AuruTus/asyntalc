@@ -1,0 +1,15 @@
+# Prepared from DeepSeek's official API reference on 2026-09-19.
+# Live validation is pending the user's temporary DEEPSEEK_API_KEY.
+[provider]
+base_url = "https://api.deepseek.com"
+model = "deepseek-flash"
+api_key_env = "DEEPSEEK_API_KEY"
+system_prompt = "You are a concise, helpful assistant."
+instruction_role = "system"
+output_token_parameter = "max_tokens"
+reasoning_effort = "none"
+max_output_tokens = 1024
+request_timeout_ms = 120000
+max_context_bytes = 262144
+max_response_bytes = 1048576
+max_output_bytes = 65536

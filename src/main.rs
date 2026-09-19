@@ -1,6 +1,8 @@
 mod cli;
+mod config;
 mod daemon;
 mod protocol;
+mod provider;
 mod store;
 
 use clap::Parser;

@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tokio::{io::BufReader, net::UnixStream};
 
 use crate::{
+    config::{self, Profile},
     daemon,
     protocol::{self, Operation, Request, Response},
 };
@@ -21,13 +22,21 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the daemon in the foreground (fake runner only in milestone 1).
+    /// Run the daemon with a provider configuration or the development fake runner.
     Daemon {
         /// Explicitly acknowledge the development-only fake runner.
-        #[arg(long, value_enum)]
-        runner: Runner,
-        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(0..=30_000))]
-        fake_delay_ms: u64,
+        #[arg(
+            long,
+            value_enum,
+            required_unless_present = "config",
+            conflicts_with = "config"
+        )]
+        runner: Option<Runner>,
+        /// TOML configuration for an OpenAI-compatible Chat Completions endpoint.
+        #[arg(long, conflicts_with = "runner")]
+        config: Option<PathBuf>,
+        #[arg(long, requires = "runner", value_parser = clap::value_parser!(u64).range(0..=30_000))]
+        fake_delay_ms: Option<u64>,
     },
     Ping,
     Submit {
@@ -79,10 +88,20 @@ enum ResultOutput {
 pub async fn run(args: Cli) -> anyhow::Result<()> {
     let (operation, text) = match args.command {
         Command::Daemon {
-            runner: Runner::Fake,
+            runner: _,
+            config,
             fake_delay_ms,
         } => {
-            return daemon::run(args.data_dir, Duration::from_millis(fake_delay_ms)).await;
+            let profile = match config {
+                Some(path) => Profile::Chat(Box::new(config::load(&path)?)),
+                None => Profile::Fake,
+            };
+            return daemon::run(
+                args.data_dir,
+                profile,
+                Duration::from_millis(fake_delay_ms.unwrap_or(100)),
+            )
+            .await;
         }
         Command::Ping => (Operation::Ping, false),
         Command::Submit { session, input, .. } => {
@@ -190,7 +209,7 @@ async fn exchange(data_dir: &std::path::Path, request: &Request) -> anyhow::Resu
     tokio::time::timeout(Duration::from_millis(timeout_ms), async {
         let mut socket = UnixStream::connect(data_dir.join("daemon.sock"))
             .await
-            .context("cannot connect to daemon; start `asyntalc daemon --runner fake` first")?;
+            .context("cannot connect to daemon; start `asyntalc daemon --config FILE` or `asyntalc daemon --runner fake` first")?;
         protocol::write_frame(&mut socket, request).await?;
         let bytes = protocol::read_frame(&mut BufReader::new(socket)).await?;
         let response: Response = serde_json::from_slice(&bytes)?;

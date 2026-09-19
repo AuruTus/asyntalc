@@ -1,12 +1,12 @@
 # Asyntalc prototype plan
 
-Status: Milestone 1 implemented; remaining milestones planned. Updated 2026-09-19.
+Status: Milestones 1–2 implemented; live-provider validation pending. Version 0.1.1, updated 2026-09-19.
 Based on [the v0.1 design](asyntalc-design-v0.1.md).
 Provider decision: an OpenAI-compatible Chat Completions API, with configurable endpoint and model.
 
-**Current verdict:** the CLI implements the durable `submit -> run_id -> wait/status -> result` interaction. It does not yet implement the full v0.1 executor: execution is a serial fake echo, with no LLM requests, parallel sessions, cancellation, or parent questions. See [section 10](#10-implemented-architecture-and-runnable-exhibition) for the implemented architecture and a runnable demonstration, and [section 11](#11-validation-against-the-v01-design) for acceptance evidence and gaps.
+**Current verdict:** the CLI implements durable submission and retrieval, real OpenAI-compatible HTTP requests, and persisted successful conversation history. The original fake runner remains available. Task execution is still serial; parallel sessions, cancellation, and parent questions remain unimplemented. See [section 12](#12-milestone-2-real-chat-requests-and-session-history) for the current architecture and validation boundary. Sections 10–11 retain the milestone 1 exhibition and historical comparison.
 
-Sections 1–9 describe the target prototype, including work that remains unimplemented. In particular, the target architecture below includes provider and scheduler components that do not exist yet.
+Sections 1–9 describe the target prototype, including work that remains unimplemented. The provider adapter now exists; the separate concurrent scheduler remains planned.
 
 The first prototype should prove that a parent can submit several tasks, exit, and later retrieve durable results. Build one Rust binary with a short-lived client and a separately started daemon. Add parent clarification after the basic request lifecycle works; add workspace tools and isolation afterward.
 
@@ -57,7 +57,7 @@ Use one OS-level exclusive lock per data directory, a private socket accessible 
 
 ## 3. CLI workflow
 
-The examples below specify the target CLI, not the current executable's exact syntax. The current binary uses `daemon --runner fake` and `wait --timeout-ms 20000`; it does not accept `--config`, `--timeout`, `resume`, or `cancel`. Use the runnable commands in section 10 to exercise milestone 1.
+The examples below specify the target CLI, not the current executable's exact syntax. The current binary accepts `daemon --config FILE` or `daemon --runner fake` and uses `wait --timeout-ms 20000`; it does not accept `--timeout`, `resume`, or `cancel`. Use section 10 for the fake exhibition and section 12 for real-provider setup.
 
 ```bash
 # Terminal 1: daemon owns API credentials and provider configuration.
@@ -253,6 +253,8 @@ That is the target demonstration after the remaining milestones. The current dem
 
 ## 10. Implemented architecture and runnable exhibition
 
+Historical baseline: this section describes milestone 1 at commit `69c96ff`. Its fake-runner commands remain supported. See section 12 for the version 0.1.1 provider path and session-history behavior.
+
 ### What actually runs today
 
 ```mermaid
@@ -431,6 +433,8 @@ Current snapshots use Unix milliseconds (`created_at_ms`, `started_at_ms`, `fini
 
 ## 11. Validation against the v0.1 design
 
+This table records the milestone 1 assessment. The provider and conversation-history rows are superseded by section 12; the original observed measurements below remain unchanged.
+
 The key hypothesis is that task lifetime belongs to the daemon rather than the submitting CLI. A blocking client would remain alive until its answer was available; this implementation returns a committed handle, permits intervening parent work, and lets a different client retrieve the result. The demonstration verifies process separation and persistence, not LLM capability or performance.
 
 The following comparison refers to the original design's sections 7, 18, and 19. Its section 18 calls the entire first useful vertical slice a milestone; that is broader than milestone 1 of this implementation plan.
@@ -478,3 +482,72 @@ Executed on 2026-09-19 against implementation commit `69c96ff`. The Bash block i
 | Documentation checks | Bash syntax valid; all 7 JSON examples parse |
 
 The roughly three-second intervals reflect the configured fake delay, not an LLM latency measurement or benchmark. The evidence establishes early client return, later result retrieval, and durability; it also directly exposes the missing parallel execution promised by the target design.
+
+## 12. Milestone 2: real chat requests and session history
+
+Version 0.1.1 adds the text-only Chat Completions adapter and successful-turn replay. It retains the same client commands and JSON version. The release is locally validated against a fake HTTP server; its live acceptance check is explicitly pending the user's temporary DeepSeek credential.
+
+```mermaid
+flowchart LR
+    C[Short-lived CLI] <-->|Unix socket| H[Daemon request handlers]
+    H --> S[Store channel and dedicated SQLite thread]
+    H -->|Wake submitted work| W[One serial async worker]
+    W -->|Load successful session history| S
+    W --> P[Chat Completions adapter]
+    P -->|Bounded HTTP request| A[Configured LLM API]
+    W --> F[Optional fake runner]
+    W -->|Commit final answer or typed failure| S
+    S --> DB[(SQLite schema 2)]
+    W -.->|Notify after commit| H
+```
+
+### What changed
+
+- [`src/config.rs`](../src/config.rs) loads a bounded TOML configuration. Endpoint, model, instruction role, output-token parameter, optional reasoning effort, and limits are explicit. Credentials are resolved from a named environment variable in the daemon.
+- [`src/provider.rs`](../src/provider.rs) sends one non-streaming request, bounds the response body, interprets finish reasons, and captures optional token usage. HTTP errors, timeouts, refused/filtered output, unsupported tools, malformed responses, and limits become typed failures. Redirects and automatic retries are disabled.
+- The store loads only successful earlier turns from the current session, then appends this run's prompt. It checks content-byte and message-count limits before loading history. Future queued prompts and failed/interrupted turns are excluded.
+- Each session retains its non-secret profile. Conflicting reuse is rejected, and a daemon cannot resume queued work under a different profile. Changing a credential value does not change session identity; restarting reloads it.
+- [`migrations/002_chat_provider.sql`](../migrations/002_chat_provider.sql) is embedded alongside migration 1. It adds session profiles, usage, finish reasons, error messages, and bounded partial answers. Existing fake sessions/results survive the transactional upgrade. Schema version is independent of the binary's `0.1.1` version and JSON protocol version `1`.
+
+`wait` snapshots now expose `phase: "model_request"`, `usage`, and optional `partial_result`. Missing token counts remain `null`. A model-request event commits before network initiation; its count is not proof of provider billing. Successful Chat runs normally end at revision 4 because they record submitted, started, model-requested, and completed events. Fake runs still complete at revision 3.
+
+### DeepSeek setup and live validation
+
+The user selected `https://api.deepseek.com` as the first live endpoint and will export a temporary key in a later session. The prepared [DeepSeek profile](../examples/deepseek.toml) uses `deepseek-flash`, system instructions, `max_tokens`, and `reasoning_effort = "none"`. These settings follow the current [DeepSeek API reference](https://api-docs.deepseek.com/api/create-chat-completion/); actual account access and live compatibility have not been verified.
+
+After making `DEEPSEEK_API_KEY` available to the daemon's environment:
+
+```bash
+cargo build --locked
+# Terminal 1
+./target/debug/asyntalc --data-dir .asyntalc/deepseek daemon --config examples/deepseek.toml
+
+# Terminal 2
+printf 'Remember the project name: Asyntalc.' | ./target/debug/asyntalc \
+  --data-dir .asyntalc/deepseek submit --session introduction --input -
+# Retain the returned run_id; substitute it for RUN_ID below.
+./target/debug/asyntalc --data-dir .asyntalc/deepseek wait --run RUN_ID --timeout-ms 20000
+
+# This follow-up receives the first successful user/assistant turn as context.
+printf 'What project name did I give you?' | ./target/debug/asyntalc \
+  --data-dir .asyntalc/deepseek submit --session introduction --input -
+```
+
+Repeat a bounded `wait` if it returns `wait_timeout`; inspect `status` rather than treating exit code 0 as task completion. Retain the second run ID as well. Both examples send prompts to the configured external provider; the fake exhibition in section 10 remains available for offline use.
+
+An opt-in automated live check uses a temporary database and makes one request:
+
+```bash
+export ASYNTALC_LIVE_CONFIG="$PWD/examples/deepseek.toml"
+cargo test --locked --test client_daemon chat_provider::live_chat_smoke -- --ignored --exact
+```
+
+The live check is ignored in normal test runs and must remain recorded as pending until it is actually executed with the user's key. Do not substitute the fake-server result for live evidence.
+
+### Local validation and remaining work
+
+The local HTTP tests gate responses to inspect exact requests while a run is active. They verify that submission returns before completion, queued prompts are excluded from prior context, successful history survives restart, other sessions remain isolated, failed turns do not poison future context, and interrupted requests are not replayed. They also exercise configuration conflicts, schema upgrades, both token-parameter variants, optional reasoning effort, response/context/output bounds, unknown usage, redirects, timeouts, and typed errors.
+
+The baseline remains the eight milestone 1 tests; the added provider tests exercise the same lifecycle through HTTP. The version 0.1.1 local suite reports **18 passed, 0 failed, and 1 ignored live test**; formatting and Clippy checks pass with Rust 1.98.1. This is functional validation, not a throughput benchmark or model-quality comparison. Full results and resumption instructions are recorded in the [milestone 2 handoff](../knowledge-base/milestone-2-chat-provider.md).
+
+Still outstanding for the first useful v0.1 slice: independent-session concurrency, explicit cancellation, durable deadlines, submission idempotency, parent clarification/resume, and run listing/log inspection. Tools and sandbox execution follow those lifecycle milestones. Finishing the DeepSeek smoke test is the next validation action before describing the provider integration as live-verified.

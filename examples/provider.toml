@@ -1,0 +1,18 @@
+# Copy this file and set your endpoint/model. The base URL includes the API
+# prefix (usually /v1); the daemon appends /chat/completions once.
+[provider]
+base_url = "https://your-provider.example/v1"
+model = "your-model"
+api_key_env = "ASYNTALC_API_KEY"
+
+# Choose the role and token parameter supported by this endpoint/model.
+system_prompt = "You are a concise, helpful assistant."
+instruction_role = "system"                 # or "developer"
+output_token_parameter = "max_tokens"       # or "max_completion_tokens"
+max_output_tokens = 4096
+# reasoning_effort = "none"                  # optional; only when supported
+
+request_timeout_ms = 120000                  # total HTTP request + response body
+max_context_bytes = 262144                   # message content, including instructions
+max_response_bytes = 1048576                 # complete HTTP response body
+max_output_bytes = 65536                     # decoded final answer, at most 65536

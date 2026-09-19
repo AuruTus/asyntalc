@@ -1,6 +1,6 @@
 [package]
 name = "asyntalc"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "A durable local executor for asynchronous subagent tasks"
@@ -9,10 +9,12 @@ publish = false
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

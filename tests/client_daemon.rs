@@ -12,6 +12,9 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_asyntalc");
 
+#[path = "support/chat_provider.rs"]
+mod chat_provider;
+
 fn private_dir() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();

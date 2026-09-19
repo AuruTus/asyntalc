@@ -1,0 +1,12 @@
+BEGIN IMMEDIATE;
+ALTER TABLE sessions ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{"runner":"fake"}';
+ALTER TABLE runs ADD COLUMN finish_reason TEXT;
+ALTER TABLE runs ADD COLUMN error_message TEXT;
+ALTER TABLE runs ADD COLUMN model_requests INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE runs ADD COLUMN input_tokens INTEGER;
+ALTER TABLE runs ADD COLUMN output_tokens INTEGER;
+ALTER TABLE runs ADD COLUMN partial_text TEXT;
+UPDATE runs SET finish_reason = 'stop' WHERE status = 'completed';
+UPDATE runs SET error_message = 'Daemon stopped before the run completed' WHERE error_code = 'daemon_interrupted';
+PRAGMA user_version = 2;
+COMMIT;

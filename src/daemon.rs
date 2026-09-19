@@ -17,7 +17,9 @@ use tokio::{
 };
 
 use crate::{
+    config::Profile,
     protocol::{self, Operation, Request, Response},
+    provider::{ChatProvider, Completion, Failure, Usage},
     store::{Store, StoreError},
 };
 
@@ -31,7 +33,12 @@ impl Drop for Ownership {
     }
 }
 
-pub async fn run(data_dir: PathBuf, fake_delay: Duration) -> anyhow::Result<()> {
+pub async fn run(data_dir: PathBuf, profile: Profile, fake_delay: Duration) -> anyhow::Result<()> {
+    let runner_name = profile.name();
+    let provider = match &profile {
+        Profile::Fake => None,
+        Profile::Chat(config) => Some(ChatProvider::new(config.as_ref().clone())?),
+    };
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -58,7 +65,7 @@ pub async fn run(data_dir: PathBuf, fake_delay: Duration) -> anyhow::Result<()> 
         );
         fs::remove_file(&socket)?;
     }
-    let store = Store::open(&data_dir.join("state.sqlite3"))?;
+    let store = Store::open(&data_dir.join("state.sqlite3"), &profile)?;
     let listener = UnixListener::bind(&socket)?;
     let _ownership = Ownership {
         _lock: lock,
@@ -72,13 +79,16 @@ pub async fn run(data_dir: PathBuf, fake_delay: Duration) -> anyhow::Result<()> 
         pending.clone(),
         changes.clone(),
         fake_delay,
+        profile,
+        provider,
     ));
     let slots = Arc::new(Semaphore::new(64));
     let mut clients = JoinSet::new();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     eprintln!(
-        "daemon ready: {} (development fake runner)",
-        socket.display()
+        "daemon ready: {} ({} runner)",
+        socket.display(),
+        runner_name
     );
     let outcome = loop {
         tokio::select! {
@@ -90,7 +100,7 @@ pub async fn run(data_dir: PathBuf, fake_delay: Duration) -> anyhow::Result<()> 
                 let changes = changes.subscribe();
                 clients.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = serve(socket, store, pending, changes).await { eprintln!("client connection: {error}"); }
+                    if let Err(error) = serve(socket, store, pending, changes, runner_name).await { eprintln!("client connection: {error}"); }
                 });
             }
             Some(result) = clients.join_next(), if !clients.is_empty() => {
@@ -124,13 +134,53 @@ async fn run_worker(
     pending: Arc<Notify>,
     changes: watch::Sender<u64>,
     delay: Duration,
+    profile: Profile,
+    provider: Option<ChatProvider>,
 ) -> anyhow::Result<()> {
     loop {
         // Notify retains a permit if submission commits between claim and notified().
         if let Some(work) = store.claim().await? {
             changes.send_modify(|revision| *revision = revision.wrapping_add(1));
-            tokio::time::sleep(delay).await;
-            store.complete(work).await?;
+            let outcome = match &profile {
+                Profile::Fake => {
+                    tokio::time::sleep(delay).await;
+                    Ok(Completion {
+                        text: format!("[fake] {}", work.input),
+                        finish_reason: "stop".into(),
+                        usage: Usage::default(),
+                    })
+                }
+                Profile::Chat(config) => {
+                    match store
+                        .context(&work, config.max_context_bytes - config.system_prompt.len())
+                        .await
+                    {
+                        Ok(messages) => {
+                            store.mark_requested(work.run_id.clone()).await?;
+                            provider
+                                .as_ref()
+                                .expect("chat profile has a provider")
+                                .complete(messages)
+                                .await
+                        }
+                        Err(error)
+                            if error
+                                .downcast_ref::<StoreError>()
+                                .is_some_and(|e| e.0 == "context_limit") =>
+                        {
+                            Err(Failure::new(
+                                "context_limit",
+                                "Conversation exceeds the configured context byte limit; start a new session",
+                            ))
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            };
+            match outcome {
+                Ok(completion) => store.complete(work, completion).await?,
+                Err(failure) => store.fail(work.run_id, failure).await?,
+            }
             changes.send_modify(|revision| *revision = revision.wrapping_add(1));
         } else {
             pending.notified().await;
@@ -143,6 +193,7 @@ async fn serve(
     store: Store,
     pending: Arc<Notify>,
     changes: watch::Receiver<u64>,
+    runner_name: &'static str,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = socket.into_split();
     let frame = timeout(
@@ -188,7 +239,7 @@ async fn serve(
             "Request ID must contain 1 to 128 bytes",
         )
     } else {
-        match dispatch(&request, &store, pending, changes).await {
+        match dispatch(&request, &store, pending, changes, runner_name).await {
             Ok(body) => Response::success(id, body),
             Err(error) => {
                 if let Some(error) = error.downcast_ref::<StoreError>() {
@@ -224,9 +275,10 @@ async fn dispatch(
     store: &Store,
     pending: Arc<Notify>,
     mut changes: watch::Receiver<u64>,
+    runner_name: &'static str,
 ) -> anyhow::Result<serde_json::Value> {
     match &request.operation {
-        Operation::Ping => Ok(json!({"ready": true, "runner": "fake"})),
+        Operation::Ping => Ok(json!({"ready": true, "runner": runner_name})),
         Operation::Submit { session_id, input } => {
             if input.trim().is_empty() || input.len() > protocol::MAX_INPUT {
                 return Err(StoreError("invalid_input").into());

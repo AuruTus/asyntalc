@@ -9,12 +9,18 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::{
+    config::Profile,
+    provider::{Completion, Failure, Message, Usage},
+};
+
 const MAX_PENDING: i64 = 128;
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 
 #[derive(Clone)]
 pub struct Store {
     sender: mpsc::Sender<Job>,
+    profile_json: String,
 }
 
 #[derive(Debug)]
@@ -39,27 +45,39 @@ pub struct Snapshot {
     pub finished_at_ms: Option<i64>,
     pub result: Option<Value>,
     pub run_error: Option<Value>,
+    pub usage: Usage,
+    pub partial_result: Option<Value>,
 }
 
 pub struct Work {
     pub run_id: String,
+    pub session_id: String,
     pub input: String,
 }
 
 impl Store {
-    pub fn open(path: &Path) -> anyhow::Result<Self> {
+    pub fn open(path: &Path, profile: &Profile) -> anyhow::Result<Self> {
         let mut conn = Connection::open(path)?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        anyhow::ensure!(
+            version <= 2,
+            "database schema is newer than this executable"
+        );
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        anyhow::ensure!(
-            version <= 1,
-            "database schema is newer than this executable"
-        );
         if version == 0 {
             conn.execute_batch(include_str!("../migrations/001_initial.sql"))?;
         }
+        if version < 2 {
+            conn.execute_batch(include_str!("../migrations/002_chat_provider.sql"))?;
+        }
+        let profile_json = serde_json::to_string(profile)?;
+        let mismatched: i64 = conn.query_row("SELECT count(*) FROM runs r JOIN sessions s ON s.id=r.session_id WHERE r.status='queued' AND s.profile_json != ?1", [&profile_json], |r| r.get(0))?;
+        anyhow::ensure!(
+            mismatched == 0,
+            "queued runs require their original provider configuration; restore it or use a separate data directory"
+        );
         recover(&mut conn)?;
         let (sender, mut receiver) = mpsc::channel::<Job>(64);
         std::thread::Builder::new()
@@ -69,7 +87,10 @@ impl Store {
                     job(&mut conn);
                 }
             })?;
-        Ok(Self { sender })
+        Ok(Self {
+            sender,
+            profile_json,
+        })
     }
 
     async fn call<T, F>(&self, job: F) -> anyhow::Result<T>
@@ -92,6 +113,7 @@ impl Store {
     }
 
     pub async fn submit(&self, session_id: Option<String>, input: String) -> anyhow::Result<Value> {
+        let profile = self.profile_json.clone();
         self.call(move |conn| {
             let tx = conn.transaction()?;
             let pending: i64 = tx.query_row("SELECT count(*) FROM runs WHERE status IN ('queued','running')", [], |r| r.get(0))?;
@@ -99,7 +121,9 @@ impl Store {
             let session_id = session_id.unwrap_or_else(|| format!("session_{}", uuid::Uuid::new_v4()));
             let run_id = format!("run_{}", uuid::Uuid::new_v4());
             let now = now_ms();
-            tx.execute("INSERT OR IGNORE INTO sessions (id, created_at_ms) VALUES (?1, ?2)", params![session_id, now])?;
+            tx.execute("INSERT OR IGNORE INTO sessions (id, created_at_ms, profile_json) VALUES (?1, ?2, ?3)", params![session_id, now, profile])?;
+            let stored_profile: String = tx.query_row("SELECT profile_json FROM sessions WHERE id=?1", [&session_id], |r| r.get(0))?;
+            if stored_profile != profile { return Err(StoreError("session_config_conflict").into()); }
             tx.execute("INSERT INTO runs (id, session_id, input, status, revision, created_at_ms) VALUES (?1, ?2, ?3, 'queued', 1, ?4)", params![run_id, session_id, input, now])?;
             event(&tx, &run_id, 1, "run.submitted")?;
             tx.commit()?;
@@ -110,21 +134,27 @@ impl Store {
     pub async fn snapshot(&self, run_id: String, include_text: bool) -> anyhow::Result<Snapshot> {
         self.call(move |conn| {
             let snapshot = conn.query_row(
-                "SELECT id, session_id, status, revision, created_at_ms, started_at_ms, finished_at_ms, result_text, error_code FROM runs WHERE id = ?1",
+                "SELECT r.id, r.session_id, r.status, r.revision, r.created_at_ms, r.started_at_ms, r.finished_at_ms, r.result_text, r.error_code, r.finish_reason, r.error_message, r.model_requests, r.input_tokens, r.output_tokens, r.partial_text, json_extract(s.profile_json, '$.runner') FROM runs r JOIN sessions s ON s.id=r.session_id WHERE r.id = ?1",
                 [&run_id], |row| {
                     let status: String = row.get(2)?;
                     let text: Option<String> = row.get(7)?;
                     let error: Option<String> = row.get(8)?;
+                    let finish_reason: Option<String> = row.get(9)?;
+                    let error_message: Option<String> = row.get(10)?;
+                    let partial_text: Option<String> = row.get(14)?;
+                    let runner: String = row.get(15)?;
                     let result = text.map(|text| {
                         let mut end = text.len().min(16 * 1024);
                         while !text.is_char_boundary(end) { end -= 1; }
-                        json!({"format": "text", "text": if include_text { Some(&text[..end]) } else { None }, "truncated": include_text && end < text.len(), "full_result_available": true, "finish_reason": "stop"})
+                        json!({"format": "text", "text": if include_text { Some(&text[..end]) } else { None }, "truncated": include_text && end < text.len(), "full_result_available": true, "finish_reason": finish_reason})
                     });
                     Ok(Snapshot {
                         run_id: row.get(0)?, session_id: row.get(1)?,
-                        phase: match status.as_str() { "queued" => "queued", "running" => "fake_execution", _ => "finished" },
+                        phase: match status.as_str() { "queued" => "queued", "running" if runner == "chat" => "model_request", "running" => "fake_execution", _ => "finished" },
                         status, revision: row.get(3)?, created_at_ms: row.get(4)?, started_at_ms: row.get(5)?, finished_at_ms: row.get(6)?, result,
-                        run_error: error.map(|code| json!({"code": code, "message": "Daemon stopped before the run completed"})),
+                        run_error: error.map(|code| json!({"code": code, "message": error_message, "finish_reason": finish_reason})),
+                        usage: Usage { model_requests: row.get(11)?, input_tokens: row.get(12)?, output_tokens: row.get(13)? },
+                        partial_result: partial_text.map(|text| json!({"format":"text", "text": if include_text { Some(text) } else { None }, "complete":false, "finish_reason":finish_reason})),
                     })
                 }).optional()?.ok_or(StoreError("run_not_found"))?;
             Ok(snapshot)
@@ -133,12 +163,12 @@ impl Store {
 
     pub async fn result(&self, run_id: String) -> anyhow::Result<Value> {
         self.call(move |conn| {
-            let row: Option<(String, Option<String>)> = conn.query_row(
-                "SELECT session_id, result_text FROM runs WHERE id = ?1", [&run_id],
-                |row| Ok((row.get(0)?, row.get(1)?))).optional()?;
-            let (session_id, text) = row.ok_or(StoreError("run_not_found"))?;
+            let row: Option<(String, Option<String>, Option<String>)> = conn.query_row(
+                "SELECT session_id, result_text, finish_reason FROM runs WHERE id = ?1", [&run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).optional()?;
+            let (session_id, text, finish_reason) = row.ok_or(StoreError("run_not_found"))?;
             let text = text.ok_or(StoreError("result_not_ready"))?;
-            Ok(json!({"run_id": run_id, "session_id": session_id, "status": "completed", "result": {"format": "text", "text": text, "truncated": false, "full_result_available": true, "finish_reason": "stop"}}))
+            Ok(json!({"run_id": run_id, "session_id": session_id, "status": "completed", "result": {"format": "text", "text": text, "truncated": false, "full_result_available": true, "finish_reason": finish_reason}}))
         }).await
     }
 
@@ -146,8 +176,8 @@ impl Store {
     pub async fn claim(&self) -> anyhow::Result<Option<Work>> {
         self.call(|conn| {
             let tx = conn.transaction()?;
-            let work = tx.query_row("SELECT id, input FROM runs WHERE status = 'queued' ORDER BY queue_position LIMIT 1", [],
-                |row| Ok(Work { run_id: row.get(0)?, input: row.get(1)? })).optional()?;
+            let work = tx.query_row("SELECT id, input, session_id FROM runs WHERE status = 'queued' ORDER BY queue_position LIMIT 1", [],
+                |row| Ok(Work { run_id: row.get(0)?, input: row.get(1)?, session_id: row.get(2)? })).optional()?;
             if let Some(work) = &work {
                 tx.execute("UPDATE runs SET status = 'running', revision = 2, started_at_ms = ?2 WHERE id = ?1", params![work.run_id, now_ms()])?;
                 event(&tx, &work.run_id, 2, "run.started")?;
@@ -157,15 +187,54 @@ impl Store {
         }).await
     }
 
-    pub async fn complete(&self, work: Work) -> anyhow::Result<()> {
+    pub async fn context(&self, work: &Work, max_bytes: usize) -> anyhow::Result<Vec<Message>> {
+        let run_id = work.run_id.clone();
+        let session_id = work.session_id.clone();
+        let input = work.input.clone();
+        self.call(move |conn| {
+            // Check the byte budget in SQL before loading an unbounded conversation.
+            let (history_bytes, history_count): (i64, i64) = conn.query_row(
+                "SELECT coalesce(sum(length(CAST(m.content AS BLOB))),0), count(*) FROM messages m JOIN runs r ON r.id=m.run_id WHERE r.session_id=?1 AND r.status='completed' AND r.queue_position < (SELECT queue_position FROM runs WHERE id=?2)",
+                params![session_id, run_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            if history_bytes as u64 + input.len() as u64 > max_bytes as u64 || history_count >= 1023 {
+                return Err(StoreError("context_limit").into());
+            }
+            let mut query = conn.prepare("SELECT m.role, m.content FROM messages m JOIN runs r ON r.id=m.run_id WHERE r.session_id=?1 AND r.status='completed' AND r.queue_position < (SELECT queue_position FROM runs WHERE id=?2) ORDER BY r.queue_position, m.id")?;
+            let mut messages = query.query_map(params![session_id, run_id], |row| Ok(Message { role: row.get(0)?, content: row.get(1)? }))?.collect::<Result<Vec<_>, _>>()?;
+            messages.push(Message { role: "user".into(), content: input });
+            Ok(messages)
+        }).await
+    }
+
+    pub async fn mark_requested(&self, run_id: String) -> anyhow::Result<()> {
         self.call(move |conn| {
             let tx = conn.transaction()?;
-            let result = format!("[fake] {}", work.input);
-            let changed = tx.execute("UPDATE runs SET status = 'completed', revision = 3, result_text = ?2, finished_at_ms = ?3 WHERE id = ?1 AND status = 'running'", params![work.run_id, result, now_ms()])?;
-            anyhow::ensure!(changed == 1, "run is no longer running");
+            let revision: i64 = tx.query_row("UPDATE runs SET model_requests=model_requests+1, revision=revision+1 WHERE id=?1 AND status='running' RETURNING revision", [&run_id], |r| r.get(0))?;
+            event(&tx, &run_id, revision, "run.model_requested")?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn complete(&self, work: Work, completion: Completion) -> anyhow::Result<()> {
+        self.call(move |conn| {
+            let tx = conn.transaction()?;
+            let result = completion.text;
+            let revision: i64 = tx.query_row("UPDATE runs SET status = 'completed', revision = revision+1, result_text = ?2, finished_at_ms = ?3, finish_reason=?4, model_requests=?5, input_tokens=?6, output_tokens=?7 WHERE id = ?1 AND status = 'running' RETURNING revision", params![work.run_id, result, now_ms(), completion.finish_reason, completion.usage.model_requests, completion.usage.input_tokens, completion.usage.output_tokens], |r| r.get(0))?;
             tx.execute("INSERT INTO messages (run_id, role, content) VALUES (?1, 'user', ?2)", params![work.run_id, work.input])?;
             tx.execute("INSERT INTO messages (run_id, role, content) VALUES (?1, 'assistant', ?2)", params![work.run_id, result])?;
-            event(&tx, &work.run_id, 3, "run.completed")?;
+            event(&tx, &work.run_id, revision, "run.completed")?;
+            tx.commit()?;
+            Ok(())
+        }).await
+    }
+
+    pub async fn fail(&self, run_id: String, failure: Failure) -> anyhow::Result<()> {
+        self.call(move |conn| {
+            let tx = conn.transaction()?;
+            let revision: i64 = tx.query_row("UPDATE runs SET status='failed', revision=revision+1, finished_at_ms=?2, error_code=?3, error_message=?4, finish_reason=?5, model_requests=?6, input_tokens=?7, output_tokens=?8, partial_text=?9 WHERE id=?1 AND status='running' RETURNING revision",
+                params![run_id, now_ms(), failure.code, failure.message, failure.finish_reason, failure.usage.model_requests, failure.usage.input_tokens, failure.usage.output_tokens, failure.partial_text], |r| r.get(0))?;
+            event(&tx, &run_id, revision, "run.failed")?;
             tx.commit()?;
             Ok(())
         }).await
@@ -183,7 +252,7 @@ fn recover(conn: &mut Connection) -> anyhow::Result<()> {
             .collect::<Result<Vec<_>, _>>()?
     };
     for (id, revision) in interrupted {
-        tx.execute("UPDATE runs SET status = 'failed', revision = revision + 1, error_code = 'daemon_interrupted', finished_at_ms = ?2 WHERE id = ?1", params![id, now_ms()])?;
+        tx.execute("UPDATE runs SET status = 'failed', revision = revision + 1, error_code = 'daemon_interrupted', error_message = 'Daemon stopped before the run completed', finished_at_ms = ?2 WHERE id = ?1", params![id, now_ms()])?;
         event(&tx, &id, revision + 1, "run.failed")?;
     }
     tx.commit()?;
