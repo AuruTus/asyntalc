@@ -1,0 +1,276 @@
+use std::{
+    fs::{self, File, OpenOptions},
+    os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+
+use anyhow::Context;
+use serde_json::json;
+use tokio::{
+    io::BufReader,
+    net::{UnixListener, UnixStream},
+    sync::{Notify, Semaphore, watch},
+    task::JoinSet,
+    time::{Instant, timeout},
+};
+
+use crate::{
+    protocol::{self, Operation, Request, Response},
+    store::{Store, StoreError},
+};
+
+struct Ownership {
+    _lock: File,
+    socket: PathBuf,
+}
+impl Drop for Ownership {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.socket);
+    }
+}
+
+pub async fn run(data_dir: PathBuf, fake_delay: Duration) -> anyhow::Result<()> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&data_dir)?;
+    let metadata = fs::symlink_metadata(&data_dir)?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0,
+        "data directory must be a private directory (mode 0700)"
+    );
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data_dir.join("daemon.lock"))?;
+    lock.try_lock()
+        .context("another daemon owns this data directory")?;
+    let socket = data_dir.join("daemon.sock");
+    // Only the lock owner may remove a stale socket. Never unlink arbitrary files.
+    if let Ok(metadata) = fs::symlink_metadata(&socket) {
+        anyhow::ensure!(
+            metadata.file_type().is_socket(),
+            "socket path exists and is not a socket"
+        );
+        fs::remove_file(&socket)?;
+    }
+    let store = Store::open(&data_dir.join("state.sqlite3"))?;
+    let listener = UnixListener::bind(&socket)?;
+    let _ownership = Ownership {
+        _lock: lock,
+        socket: socket.clone(),
+    };
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let pending = Arc::new(Notify::new());
+    let (changes, _) = watch::channel(0_u64);
+    let mut worker = tokio::spawn(run_worker(
+        store.clone(),
+        pending.clone(),
+        changes.clone(),
+        fake_delay,
+    ));
+    let slots = Arc::new(Semaphore::new(64));
+    let mut clients = JoinSet::new();
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    eprintln!(
+        "daemon ready: {} (development fake runner)",
+        socket.display()
+    );
+    let outcome = loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (socket, _) = match accepted { Ok(value) => value, Err(error) => break Err(error.into()) };
+                let Ok(permit) = slots.clone().try_acquire_owned() else { drop(socket); continue; };
+                let store = store.clone();
+                let pending = pending.clone();
+                let changes = changes.subscribe();
+                clients.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = serve(socket, store, pending, changes).await { eprintln!("client connection: {error}"); }
+                });
+            }
+            Some(result) = clients.join_next(), if !clients.is_empty() => {
+                if let Err(error) = result { eprintln!("client task: {error}"); }
+            }
+            result = &mut worker => {
+                break match result {
+                    Ok(Err(error)) => Err(error),
+                    Ok(Ok(())) => Err(anyhow::anyhow!("worker stopped unexpectedly")),
+                    Err(error) => Err(error.into()),
+                };
+            }
+            signal = tokio::signal::ctrl_c() => { break signal.map_err(Into::into); }
+            _ = terminate.recv() => { break Ok(()); }
+        }
+    };
+    clients.abort_all();
+    while clients.join_next().await.is_some() {}
+    worker.abort();
+    if !worker.is_finished() {
+        let _ = worker.await;
+    }
+    // All accepted DB jobs finish before the store barrier returns. Keep the lock until then.
+    // Store clones held by aborted tasks have now been dropped.
+    store.barrier().await?;
+    outcome
+}
+
+async fn run_worker(
+    store: Store,
+    pending: Arc<Notify>,
+    changes: watch::Sender<u64>,
+    delay: Duration,
+) -> anyhow::Result<()> {
+    loop {
+        // Notify retains a permit if submission commits between claim and notified().
+        if let Some(work) = store.claim().await? {
+            changes.send_modify(|revision| *revision = revision.wrapping_add(1));
+            tokio::time::sleep(delay).await;
+            store.complete(work).await?;
+            changes.send_modify(|revision| *revision = revision.wrapping_add(1));
+        } else {
+            pending.notified().await;
+        }
+    }
+}
+
+async fn serve(
+    socket: UnixStream,
+    store: Store,
+    pending: Arc<Notify>,
+    changes: watch::Receiver<u64>,
+) -> anyhow::Result<()> {
+    let (reader, mut writer) = socket.into_split();
+    let frame = timeout(
+        Duration::from_secs(5),
+        protocol::read_frame(&mut BufReader::new(reader)),
+    )
+    .await;
+    let request: Result<Request, _> = match frame {
+        Ok(Ok(bytes)) => serde_json::from_slice(&bytes),
+        _ => {
+            return send(
+                &mut writer,
+                &Response::error(
+                    None,
+                    "invalid_frame",
+                    "Request is incomplete, oversized, or timed out",
+                ),
+            )
+            .await;
+        }
+    };
+    let request = match request {
+        Ok(request) => request,
+        Err(_) => {
+            return send(
+                &mut writer,
+                &Response::error(None, "invalid_request", "Invalid request JSON or operation"),
+            )
+            .await;
+        }
+    };
+    let id = &request.request_id;
+    let response = if request.protocol_version != protocol::VERSION {
+        Response::error(
+            Some(id),
+            "unsupported_version",
+            "Expected protocol version 1",
+        )
+    } else if id.is_empty() || id.len() > 128 {
+        Response::error(
+            None,
+            "invalid_request",
+            "Request ID must contain 1 to 128 bytes",
+        )
+    } else {
+        match dispatch(&request, &store, pending, changes).await {
+            Ok(body) => Response::success(id, body),
+            Err(error) => {
+                if let Some(error) = error.downcast_ref::<StoreError>() {
+                    Response::error(Some(id), error.0, error.0)
+                } else {
+                    eprintln!("request failed: {error:#}");
+                    Response::error(
+                        Some(id),
+                        "internal_error",
+                        "Daemon could not complete the operation",
+                    )
+                }
+            }
+        }
+    };
+    send(&mut writer, &response).await
+}
+
+async fn send(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    response: &Response,
+) -> anyhow::Result<()> {
+    timeout(
+        Duration::from_secs(5),
+        protocol::write_frame(writer, response),
+    )
+    .await
+    .context("response write timed out")?
+}
+
+async fn dispatch(
+    request: &Request,
+    store: &Store,
+    pending: Arc<Notify>,
+    mut changes: watch::Receiver<u64>,
+) -> anyhow::Result<serde_json::Value> {
+    match &request.operation {
+        Operation::Ping => Ok(json!({"ready": true, "runner": "fake"})),
+        Operation::Submit { session_id, input } => {
+            if input.trim().is_empty() || input.len() > protocol::MAX_INPUT {
+                return Err(StoreError("invalid_input").into());
+            }
+            if session_id.as_ref().is_some_and(|id| {
+                id.is_empty()
+                    || id.len() > 128
+                    || !id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+            }) {
+                return Err(StoreError("invalid_session_id").into());
+            }
+            let receipt = store.submit(session_id.clone(), input.clone()).await?;
+            // Notification happens even if the client disconnected after submission.
+            pending.notify_one();
+            Ok(receipt)
+        }
+        Operation::Status { run_id } => {
+            let mut snapshot = serde_json::to_value(store.snapshot(run_id.clone(), false).await?)?;
+            snapshot["return_reason"] = json!("snapshot");
+            Ok(snapshot)
+        }
+        Operation::Result { run_id } => store.result(run_id.clone()).await,
+        Operation::Wait { run_id, timeout_ms } => {
+            if *timeout_ms > protocol::MAX_WAIT_MS {
+                return Err(StoreError("invalid_timeout").into());
+            }
+            let deadline = Instant::now() + Duration::from_millis(*timeout_ms);
+            loop {
+                let snapshot = store.snapshot(run_id.clone(), true).await?;
+                let terminal = matches!(snapshot.status.as_str(), "completed" | "failed");
+                let mut value = serde_json::to_value(snapshot)?;
+                if terminal || Instant::now() >= deadline {
+                    value["return_reason"] =
+                        json!(if terminal { "terminal" } else { "wait_timeout" });
+                    return Ok(value);
+                }
+                // The receiver was subscribed before reading state. Read again even on timeout.
+                tokio::select! {
+                    changed = changes.changed() => { changed.context("worker notification channel closed")?; }
+                    _ = tokio::time::sleep_until(deadline) => {}
+                }
+            }
+        }
+    }
+}

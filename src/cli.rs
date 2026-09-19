@@ -1,0 +1,209 @@
+use std::{io::Read, path::PathBuf, time::Duration};
+
+use anyhow::{Context, bail};
+use clap::{Parser, Subcommand, ValueEnum};
+use tokio::{io::BufReader, net::UnixStream};
+
+use crate::{
+    daemon,
+    protocol::{self, Operation, Request, Response},
+};
+
+#[derive(Parser)]
+#[command(version, about)]
+pub struct Cli {
+    /// Private directory shared by this daemon and its clients.
+    #[arg(long, global = true, default_value = ".asyntalc")]
+    data_dir: PathBuf,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the daemon in the foreground (fake runner only in milestone 1).
+    Daemon {
+        /// Explicitly acknowledge the development-only fake runner.
+        #[arg(long, value_enum)]
+        runner: Runner,
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(0..=30_000))]
+        fake_delay_ms: u64,
+    },
+    Ping,
+    Submit {
+        #[arg(long)]
+        session: Option<String>,
+        /// UTF-8 prompt file, or - for stdin.
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, value_enum, default_value = "json")]
+        output: JsonOutput,
+    },
+    Status {
+        #[arg(long)]
+        run: String,
+        #[arg(long, value_enum, default_value = "json")]
+        output: JsonOutput,
+    },
+    Wait {
+        #[arg(long)]
+        run: String,
+        /// Bounded server wait in milliseconds; does not cancel the run.
+        #[arg(long, default_value_t = 20_000, value_parser = clap::value_parser!(u64).range(0..=30_000))]
+        timeout_ms: u64,
+        #[arg(long, value_enum, default_value = "json")]
+        output: JsonOutput,
+    },
+    Result {
+        #[arg(long)]
+        run: String,
+        #[arg(long, value_enum, default_value = "json")]
+        output: ResultOutput,
+    },
+}
+
+#[derive(Clone, ValueEnum)]
+enum Runner {
+    Fake,
+}
+#[derive(Clone, ValueEnum)]
+enum JsonOutput {
+    Json,
+}
+#[derive(Clone, ValueEnum)]
+enum ResultOutput {
+    Json,
+    Text,
+}
+
+pub async fn run(args: Cli) -> anyhow::Result<()> {
+    let (operation, text) = match args.command {
+        Command::Daemon {
+            runner: Runner::Fake,
+            fake_delay_ms,
+        } => {
+            return daemon::run(args.data_dir, Duration::from_millis(fake_delay_ms)).await;
+        }
+        Command::Ping => (Operation::Ping, false),
+        Command::Submit { session, input, .. } => {
+            // Read before any network request, with a bound even for stdin.
+            let input = match read_input(input) {
+                Ok(input) => input,
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&Response::error(
+                            None,
+                            "invalid_input",
+                            &error.to_string()
+                        ))?
+                    );
+                    return Err(error);
+                }
+            };
+            (
+                Operation::Submit {
+                    session_id: session,
+                    input,
+                },
+                false,
+            )
+        }
+        Command::Status { run, .. } => (Operation::Status { run_id: run }, false),
+        Command::Wait {
+            run, timeout_ms, ..
+        } => (
+            Operation::Wait {
+                run_id: run,
+                timeout_ms,
+            },
+            false,
+        ),
+        Command::Result { run, output } => (
+            Operation::Result { run_id: run },
+            matches!(output, ResultOutput::Text),
+        ),
+    };
+    let request = Request {
+        protocol_version: protocol::VERSION,
+        request_id: format!("req_{}", uuid::Uuid::new_v4()),
+        operation,
+    };
+    let response = match exchange(&args.data_dir, &request).await {
+        Ok(response) => response,
+        Err(error) => {
+            if !text {
+                println!(
+                    "{}",
+                    serde_json::to_string(&Response::error(
+                        Some(&request.request_id),
+                        "transport_error",
+                        &error.to_string()
+                    ))?
+                );
+            }
+            return Err(error);
+        }
+    };
+    if text {
+        if response.ok {
+            print!(
+                "{}",
+                response.body["result"]["text"]
+                    .as_str()
+                    .context("invalid result response")?
+            );
+        }
+    } else {
+        println!("{}", serde_json::to_string(&response)?);
+    }
+    if !response.ok {
+        bail!("{}", response.body["error"]);
+    }
+    Ok(())
+}
+
+fn read_input(path: PathBuf) -> anyhow::Result<String> {
+    let reader: Box<dyn Read> = if path.as_os_str() == "-" {
+        Box::new(std::io::stdin())
+    } else {
+        Box::new(std::fs::File::open(&path).context("cannot open input file")?)
+    };
+    let mut bytes = Vec::new();
+    reader
+        .take((protocol::MAX_INPUT + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() <= protocol::MAX_INPUT,
+        "input exceeds 64 KiB limit"
+    );
+    let input = String::from_utf8(bytes).context("input must be UTF-8")?;
+    anyhow::ensure!(!input.trim().is_empty(), "input is empty");
+    Ok(input)
+}
+
+async fn exchange(data_dir: &std::path::Path, request: &Request) -> anyhow::Result<Response> {
+    let timeout_ms = match request.operation {
+        Operation::Wait { timeout_ms, .. } => timeout_ms + 5_000,
+        _ => 5_000,
+    };
+    tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        let mut socket = UnixStream::connect(data_dir.join("daemon.sock"))
+            .await
+            .context("cannot connect to daemon; start `asyntalc daemon --runner fake` first")?;
+        protocol::write_frame(&mut socket, request).await?;
+        let bytes = protocol::read_frame(&mut BufReader::new(socket)).await?;
+        let response: Response = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(
+            response.protocol_version == protocol::VERSION,
+            "unsupported response version"
+        );
+        anyhow::ensure!(
+            response.request_id.as_deref() == Some(&request.request_id),
+            "response request ID mismatch"
+        );
+        Ok(response)
+    })
+    .await
+    .context("daemon response timed out; submitted work may still be running")?
+}
