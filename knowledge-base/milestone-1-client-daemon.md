@@ -32,6 +32,12 @@ The tests cover separate-process submission and result retrieval; persisted life
 
 Initial failures: test temporary directories needed explicit 0700 permissions; the execution sandbox denied Unix socket creation. The fixtures now set permissions, and integration tests passed with sandbox escalation. Dependency downloads also required escalation for registry access. No live provider request has been made.
 
+## Architecture exhibition and design comparison
+
+A follow-up validation on 2026-09-19 executed the exact Bash example now included in [prototype-plan section 10](../docs/asyntalc-prototype-plan.md#10-implemented-architecture-and-runnable-exhibition), against implementation commit `69c96ff`. After both submit clients exited, A was running and B in a different session remained queued. Their stored execution durations were 3,004 ms and 3,005 ms with a configured 3,000 ms fake delay; the intervals did not overlap. Both answers were correct fake echoes, and A's answer survived daemon restart byte-for-byte. SQLite held 2 sessions, 2 runs, 4 messages, and 6 events. All 8 integration tests passed again.
+
+The plan now distinguishes implemented architecture and runnable commands from target behavior and compares the result with v0.1 acceptance criteria. Preserve this distinction: asynchronous submission is working, but independent-session execution remains serial, session history is stored without being replayed into model context, and the original design's section 18 milestone is broader than milestone 1 of the implementation plan. No application behavior was changed for this exhibition.
+
 ## Next delivery
 
 Implement milestone 2 using the selected OpenAI-compatible Chat Completions API. Read the OpenAI Docs skill and current official schema before implementation. Configure endpoint/model and resolve the key only in the daemon. Keep the fake runner and add a fake HTTP endpoint for reproducible adapter tests.

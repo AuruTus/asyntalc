@@ -1,8 +1,12 @@
 # Asyntalc prototype plan
 
-Status: Proposed implementation plan, 2026-09-19.
+Status: Milestone 1 implemented; remaining milestones planned. Updated 2026-09-19.
 Based on [the v0.1 design](asyntalc-design-v0.1.md).
 Provider decision: an OpenAI-compatible Chat Completions API, with configurable endpoint and model.
+
+**Current verdict:** the CLI implements the durable `submit -> run_id -> wait/status -> result` interaction. It does not yet implement the full v0.1 executor: execution is a serial fake echo, with no LLM requests, parallel sessions, cancellation, or parent questions. See [section 10](#10-implemented-architecture-and-runnable-exhibition) for the implemented architecture and a runnable demonstration, and [section 11](#11-validation-against-the-v01-design) for acceptance evidence and gaps.
+
+Sections 1–9 describe the target prototype, including work that remains unimplemented. In particular, the target architecture below includes provider and scheduler components that do not exist yet.
 
 The first prototype should prove that a parent can submit several tasks, exit, and later retrieve durable results. Build one Rust binary with a short-lived client and a separately started daemon. Add parent clarification after the basic request lifecycle works; add workspace tools and isolation afterward.
 
@@ -53,7 +57,7 @@ Use one OS-level exclusive lock per data directory, a private socket accessible 
 
 ## 3. CLI workflow
 
-The examples below specify planned commands; no executable exists yet.
+The examples below specify the target CLI, not the current executable's exact syntax. The current binary uses `daemon --runner fake` and `wait --timeout-ms 20000`; it does not accept `--config`, `--timeout`, `resume`, or `cancel`. Use the runnable commands in section 10 to exercise milestone 1.
 
 ```bash
 # Terminal 1: daemon owns API credentials and provider configuration.
@@ -75,7 +79,7 @@ asyntalc cancel --run run_a --output json
 
 Support stdin through `--input -`. Make JSON the prototype default; `--output text` is explicit. Diagnostics belong on stderr. Use the existing document's `asyntalc` spelling consistently until a separate naming decision is made.
 
-`wait` blocks only the invocation that calls it, for a bounded time. The daemon continues all eligible runs. Even a host that invokes CLI tools sequentially can submit A, submit B, do local work, and then wait; A and B overlap in the daemon. The host must choose when to wait—this executable cannot force the parent model to continue reasoning while its host blocks on a tool.
+`wait` blocks only the invocation that calls it, for a bounded time. The daemon continues eligible work. Even a host that invokes CLI tools sequentially can submit A, submit B, do local work, and then wait. In the target scheduler A and B can execute concurrently; in milestone 1 they execute serially while the parent remains free between client invocations. The host must choose when to wait—this executable cannot force the parent model to continue reasoning while its host blocks on a tool.
 
 Add `runs list --status ...` with pagination to rediscover handles after a parent restart. Add `logs --run ... --after-seq ... --limit ...` for finite event retrieval. Defer live JSONL streaming and `send` convenience mode until the core works.
 
@@ -244,3 +248,233 @@ Add workspace reads and search, then sandboxed commands with explicit policies, 
 Then consider wait-any, structured result schemas, provider streaming, additional adapters, artifacts, and retention. Defer automatic delegation, DAG scheduling, multi-host operation, MCP integration, and transparent interrupted-request replay until the basic lifecycle has proven useful.
 
 The first end-to-end demonstration is: submit A and B, exit both clients, observe concurrent execution, receive and answer a question from A, collect both final answers, and verify that a daemon interruption produces explicit recoverable state rather than silent duplication.
+
+That is the target demonstration after the remaining milestones. The current demonstration below establishes the smaller milestone 1 contract.
+
+## 10. Implemented architecture and runnable exhibition
+
+### What actually runs today
+
+```mermaid
+flowchart LR
+    P[Parent agent or shell] --> C[Short-lived CLI process]
+    C <-->|One JSON request and response over Unix socket| H
+    subgraph D[Long-lived daemon process]
+        H[Concurrent connection handlers]
+        W[One async fake worker: global FIFO]
+        Q[Bounded database job channel]
+        T[Dedicated database thread]
+        H -->|Submit and query jobs| Q
+        H -->|Notify after submit commit| W
+        W -->|Claim and complete jobs| Q
+        Q --> T
+        W -.->|Wake waiters after state commits| H
+    end
+    T --> DB[(SQLite: sessions, runs, messages, events)]
+```
+
+There is one executable with two roles, not a daemon spawned on every invocation. Start the daemon once; each `submit`, `status`, `wait`, or `result` launches a separate client process. The shell's `&` in the demonstration backgrounds the long-lived daemon. It is not needed for `submit` to return before its run finishes.
+
+| Implemented module | Responsibility |
+|---|---|
+| [`src/cli.rs`](../src/cli.rs) | Parse arguments, read file/stdin input, connect, validate response IDs/version, print JSON or result text, exit. |
+| [`src/protocol.rs`](../src/protocol.rs) | Versioned request/response envelopes, newline framing, and frame/input/wait limits. |
+| [`src/daemon.rs`](../src/daemon.rs) | Own the directory lock and private socket, handle clients concurrently, run the serial fake worker, and wake bounded waits. |
+| [`src/store.rs`](../src/store.rs) | Own SQLite on a dedicated thread; transact submissions, claims, completions, events, and startup recovery. |
+| [`migrations/001_initial.sql`](../migrations/001_initial.sql) | Schema version 1 and the four persistent tables. |
+
+A submission commits a queued run and its event before returning its receipt. The fake worker independently claims the oldest queued run, waits for the configured delay, and commits `[fake] <input>` plus two messages and a completion event. Waiters subscribe before reading state and re-read SQLite after notifications; the database remains authoritative.
+
+**Concurrency has two meanings here.** Client requests and waiting connections can coexist. Task execution is still limited to one worker across every session. A reused session ID groups persisted records, but the fake worker does not read previous messages or maintain model conversational context.
+
+### Copy-and-run demonstration
+
+Run this Bash block from the repository root. It requires the Rust build prerequisites and Python 3's standard library for JSON parsing/assertions, but no API key. It uses an isolated directory, verifies both answers and serial execution, and leaves JSON evidence plus SQLite there for inspection. A trap stops only the daemon launched by this example.
+
+```bash
+set -euo pipefail
+cargo build --locked
+demo_bin="$PWD/target/debug/asyntalc"
+demo_dir="$(mktemp -d /tmp/asyntalc-demo.XXXXXX)"
+
+start_demo_daemon() {
+  "$demo_bin" --data-dir "$demo_dir" daemon --runner fake --fake-delay-ms 3000 \
+    >"$demo_dir/daemon.stdout" 2>"$demo_dir/daemon.stderr" &
+  demo_pid=$!
+  for attempt in {1..50}; do
+    if "$demo_bin" --data-dir "$demo_dir" ping >/dev/null 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  cat "$demo_dir/daemon.stderr" >&2
+  return 1
+}
+trap 'kill "$demo_pid" 2>/dev/null || true; wait "$demo_pid" 2>/dev/null || true' EXIT
+start_demo_daemon
+
+# Each submitting client exits while the daemon retains its work.
+printf 'Review API design' | "$demo_bin" --data-dir "$demo_dir" submit \
+  --session api-review --input - >"$demo_dir/submit-a.json"
+printf 'Review storage design' | "$demo_bin" --data-dir "$demo_dir" submit \
+  --session storage-review --input - >"$demo_dir/submit-b.json"
+run_a="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$demo_dir/submit-a.json")"
+run_b="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$demo_dir/submit-b.json")"
+
+# A zero-duration wait takes a snapshot; it does not cancel work.
+"$demo_bin" --data-dir "$demo_dir" wait --run "$run_a" --timeout-ms 0 \
+  >"$demo_dir/pending-a.json"
+"$demo_bin" --data-dir "$demo_dir" status --run "$run_b" >"$demo_dir/status-b.json"
+echo 'Parent is free to do local work between CLI calls.'
+
+# Wait only when the answers are needed.
+"$demo_bin" --data-dir "$demo_dir" wait --run "$run_a" --timeout-ms 10000 \
+  >"$demo_dir/completed-a.json"
+"$demo_bin" --data-dir "$demo_dir" wait --run "$run_b" --timeout-ms 10000 \
+  >"$demo_dir/completed-b.json"
+"$demo_bin" --data-dir "$demo_dir" result --run "$run_a" --output text >"$demo_dir/answer.txt"
+
+# Restart the daemon; the answer must remain byte-for-byte identical.
+kill "$demo_pid"
+wait "$demo_pid"
+start_demo_daemon
+"$demo_bin" --data-dir "$demo_dir" result --run "$run_a" --output text >"$demo_dir/answer-after-restart.txt"
+cmp "$demo_dir/answer.txt" "$demo_dir/answer-after-restart.txt"
+
+python3 - "$demo_dir" <<'PY'
+import json, pathlib, sqlite3, sys
+root = pathlib.Path(sys.argv[1])
+def load(name):
+    return json.loads((root / name).read_text())
+a, b = load('completed-a.json'), load('completed-b.json')
+for name in ('submit-a.json', 'submit-b.json'):
+    receipt = load(name)
+    assert receipt['ok'] and receipt['status'] == 'queued'
+for result, expected in ((a, '[fake] Review API design'), (b, '[fake] Review storage design')):
+    assert result['ok'] and result['status'] == 'completed'
+    assert result['return_reason'] == 'terminal'
+    assert result['result']['text'] == expected
+assert b['started_at_ms'] >= a['finished_at_ms'], 'milestone 1 executes serially'
+with sqlite3.connect(root / 'state.sqlite3') as db:
+    counts = {table: db.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
+              for table in ('sessions', 'runs', 'messages', 'events')}
+assert counts == {'sessions': 2, 'runs': 2, 'messages': 4, 'events': 6}
+print(json.dumps({'validated': True, 'counts': counts,
+    'initial_a': load('pending-a.json')['status'],
+    'initial_wait_reason': load('pending-a.json')['return_reason'],
+    'initial_b': load('status-b.json')['status'],
+    'a_execution_ms': a['finished_at_ms'] - a['started_at_ms'],
+    'b_execution_ms': b['finished_at_ms'] - b['started_at_ms']}, indent=2))
+print(f'Evidence retained at {root}')
+PY
+```
+
+Usually the initial snapshots show A as `running` with `return_reason: "wait_timeout"`, and B as `queued`, despite their different sessions. A heavily delayed shell might inspect them after completion; the validation therefore uses persisted start/finish ordering, not an assumed observation time. Both submit receipts describe acceptance as `queued` regardless of a later state change.
+
+### What the parent receives
+
+Below are representative response excerpts from the demonstration, with IDs shortened and timestamp fields omitted. Actual commands return the complete envelopes; the evidence files above retain them.
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "req_submit_a",
+  "ok": true,
+  "run_id": "run_a",
+  "session_id": "api-review",
+  "status": "queued",
+  "revision": 1
+}
+```
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "req_wait_a",
+  "ok": true,
+  "run_id": "run_a",
+  "session_id": "api-review",
+  "status": "running",
+  "revision": 2,
+  "phase": "fake_execution",
+  "return_reason": "wait_timeout",
+  "result": null,
+  "run_error": null
+}
+```
+
+```json
+{
+  "protocol_version": 1,
+  "request_id": "req_completed_a",
+  "ok": true,
+  "run_id": "run_a",
+  "session_id": "api-review",
+  "status": "completed",
+  "revision": 3,
+  "phase": "finished",
+  "return_reason": "terminal",
+  "result": {
+    "format": "text",
+    "text": "[fake] Review API design",
+    "truncated": false,
+    "full_result_available": true,
+    "finish_reason": "stop"
+  },
+  "run_error": null
+}
+```
+
+`ok` describes the CLI operation; `status` describes the durable task. A wait timeout is a successful query and exits 0. Querying an interrupted run also exits 0, with `status: "failed"` and `run_error.code: "daemon_interrupted"`. An unknown run returns `ok: false`, `error.code: "run_not_found"`, and exit code 1. Invalid CLI arguments exit 2.
+
+Current snapshots use Unix milliseconds (`created_at_ms`, `started_at_ms`, `finished_at_ms`). They do not yet contain the target contract's usage, parent question, progress, cancellation, or blocking-run fields. `status` omits answer text; `wait` includes up to 16 KiB with an explicit truncation flag; `result` retrieves full text. The fake runner's `finish_reason: "stop"` is a placeholder, not evidence of an LLM response.
+
+## 11. Validation against the v0.1 design
+
+The key hypothesis is that task lifetime belongs to the daemon rather than the submitting CLI. A blocking client would remain alive until its answer was available; this implementation returns a committed handle, permits intervening parent work, and lets a different client retrieve the result. The demonstration verifies process separation and persistence, not LLM capability or performance.
+
+The following comparison refers to the original design's sections 7, 18, and 19. Its section 18 calls the entire first useful vertical slice a milestone; that is broader than milestone 1 of this implementation plan.
+
+| v0.1 behavior | Current result | Evidence or missing work |
+|---|---|---|
+| One binary, short-lived CLI, long-lived daemon | Implemented | Demonstration uses separate client processes against one socket. |
+| Durable handle returned before task completion | Implemented | Submission commits before acknowledging; demonstration captures a nonterminal snapshot after the submit client exits. |
+| Create/reuse sessions | Partly implemented | Session records and IDs exist. No provider configuration or context replay yet. |
+| One real LLM provider | Not implemented | Fake echo only; milestone 2. |
+| Persist sessions, runs, messages, lifecycle events | Implemented for the fake lifecycle | Demonstration checks 2 sessions, 2 runs, 4 messages, and 6 events. |
+| Retrieve an answer from a later CLI process | Implemented | `wait` and `result`, including byte-identical retrieval after restart. |
+| Independent sessions execute concurrently | Not implemented | Demonstration verifies B starts after A finishes. Client concurrency is not task concurrency. |
+| Same-session FIFO and ordered conversation | Partly implemented | Global FIFO also serializes same-session runs, but the worker never reads prior messages. Conversational continuity is unvalidated. |
+| Bounded wait without task cancellation | Implemented | Zero-duration demonstration plus timeout/disconnection integration test. |
+| Explicit cancellation and run deadlines | Not implemented | Only client wait timeouts exist. `cancel` is unavailable. |
+| Parent question and resume | Not implemented | No `waiting_for_parent`, `ask_parent`, or `resume`. |
+| Restart produces understandable state | Implemented for fake work | Tests verify active runs fail with `daemon_interrupted`, queued runs recover, and completed answers survive. No tool-call recovery has been exercised. |
+| Synchronous `send`, logs, streaming | Deferred | Current commands are `daemon`, `ping`, `submit`, `status`, `wait`, and `result`. |
+| Tools and sandbox isolation | Not implemented | Socket/data-directory permissions protect local access; they are not a tool sandbox. |
+
+The executable therefore validates the **async client contract**, but it does not yet satisfy all eleven acceptance items in v0.1 section 18. It becomes a basic LLM client/daemon when milestone 2 is complete; it supports concurrent subagent execution when milestone 3 adds independent-session scheduling, and parent clarification when milestone 4 is complete.
+
+Validation commands and automated coverage are in [`tests/client_daemon.rs`](../tests/client_daemon.rs):
+
+```bash
+cargo test --locked
+```
+
+The exhibition above complements those tests with a reproducible user-facing flow and durable-state inspection. Model quality, session context correctness, rate limits, cancellation races, parent interaction, and sandbox safety remain outside this milestone's validation.
+
+### Observed validation result
+
+Executed on 2026-09-19 against implementation commit `69c96ff`. The Bash block in section 10 was extracted directly from this document and executed successfully; these are observed results, not just expected output.
+
+| Check | Observed result |
+|---|---|
+| A after both submit clients exited | `running`, `return_reason: "wait_timeout"` |
+| B in another session at the same checkpoint | `queued` |
+| Final answers | `[fake] Review API design` and `[fake] Review storage design` |
+| Stored execution intervals | A: 3,004 ms; B: 3,005 ms; B started at or after A finished |
+| Persisted records | 2 sessions, 2 runs, 4 messages, 6 lifecycle events |
+| Answer after daemon restart | Byte-for-byte identical; `cmp` succeeded |
+| Integration suite | 8 passed, 0 failed |
+| Documentation checks | Bash syntax valid; all 7 JSON examples parse |
+
+The roughly three-second intervals reflect the configured fake delay, not an LLM latency measurement or benchmark. The evidence establishes early client return, later result retrieval, and durability; it also directly exposes the missing parallel execution promised by the target design.
