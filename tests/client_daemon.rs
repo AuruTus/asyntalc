@@ -14,6 +14,8 @@ const BIN: &str = env!("CARGO_BIN_EXE_asyntalc");
 
 #[path = "support/chat_provider.rs"]
 mod chat_provider;
+#[path = "support/inspection.rs"]
+mod inspection;
 #[path = "support/scheduler.rs"]
 mod scheduler;
 

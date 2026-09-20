@@ -9,6 +9,19 @@ pub fn default_run_timeout_ms() -> u64 {
     600_000
 }
 pub const MAX_RUN_TIMEOUT_MS: u64 = 86_400_000;
+pub fn default_page_limit() -> u32 {
+    50
+}
+pub const MAX_PAGE_LIMIT: u32 = 100;
+pub const RUN_STATUSES: [&str; 7] = [
+    "queued",
+    "running",
+    "waiting_for_parent",
+    "completed",
+    "failed",
+    "cancelled",
+    "timed_out",
+];
 pub const MAX_WAIT_MS: u64 = 30_000;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -23,6 +36,21 @@ pub struct Request {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Ping,
+    List {
+        session_id: Option<String>,
+        status: Option<String>,
+        #[serde(default)]
+        after: i64,
+        #[serde(default = "default_page_limit")]
+        limit: u32,
+    },
+    Logs {
+        run_id: String,
+        #[serde(default)]
+        after_seq: i64,
+        #[serde(default = "default_page_limit")]
+        limit: u32,
+    },
     Submit {
         session_id: Option<String>,
         input: String,

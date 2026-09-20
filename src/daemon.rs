@@ -233,6 +233,21 @@ async fn dispatch(
 ) -> anyhow::Result<serde_json::Value> {
     match &request.operation {
         Operation::Ping => Ok(json!({"ready": true, "runner": runner_name})),
+        Operation::List {
+            session_id,
+            status,
+            after,
+            limit,
+        } => {
+            store
+                .list(session_id.clone(), status.clone(), *after, *limit)
+                .await
+        }
+        Operation::Logs {
+            run_id,
+            after_seq,
+            limit,
+        } => store.logs(run_id.clone(), *after_seq, *limit).await,
         Operation::Submit {
             session_id,
             input,

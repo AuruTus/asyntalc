@@ -42,6 +42,30 @@ enum Command {
         max_active_runs: u64,
     },
     Ping,
+    /// Discover runs in submission order; continue from next_after.
+    List {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, value_parser = protocol::RUN_STATUSES)]
+        status: Option<String>,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+        after: i64,
+        #[arg(long, default_value_t = protocol::default_page_limit(), value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        #[arg(long, value_enum, default_value = "json")]
+        output: JsonOutput,
+    },
+    /// Read a finite page of durable lifecycle events for one run.
+    Logs {
+        #[arg(long)]
+        run: String,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+        after_seq: i64,
+        #[arg(long, default_value_t = protocol::default_page_limit(), value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        #[arg(long, value_enum, default_value = "json")]
+        output: JsonOutput,
+    },
     Submit {
         #[arg(long)]
         session: Option<String>,
@@ -133,6 +157,34 @@ pub async fn run(args: Cli) -> anyhow::Result<()> {
             .await;
         }
         Command::Ping => (Operation::Ping, false),
+        Command::List {
+            session,
+            status,
+            after,
+            limit,
+            ..
+        } => (
+            Operation::List {
+                session_id: session,
+                status,
+                after,
+                limit,
+            },
+            false,
+        ),
+        Command::Logs {
+            run,
+            after_seq,
+            limit,
+            ..
+        } => (
+            Operation::Logs {
+                run_id: run,
+                after_seq,
+                limit,
+            },
+            false,
+        ),
         Command::Submit {
             session,
             input,

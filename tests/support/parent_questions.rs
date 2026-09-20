@@ -37,6 +37,10 @@ fn parent_question_survives_restart_and_resume_commits_full_history() {
     let waiting = wait(&daemon, &a);
     assert_eq!(waiting["return_reason"], "input_required");
     let q = waiting["input_request"].clone();
+    let discovered = daemon.rpc(json!({"op":"list","status":"waiting_for_parent"}));
+    assert_eq!(discovered["runs"][0]["run_id"], a);
+    assert_eq!(discovered["runs"][0]["question_id"], q["question_id"]);
+    assert!(!discovered.to_string().contains("Which option?"));
     let a2 = daemon.submit("second");
     assert_eq!(
         daemon.rpc(json!({"op":"status","run_id":a2}))["blocked_by_run_id"],
@@ -69,6 +73,27 @@ fn parent_question_survives_restart_and_resume_commits_full_history() {
     api.reply(Reply::Json(200, answer("final")));
     let done = wait(&daemon, &a);
     assert_eq!(done["status"], "completed");
+    let log = daemon.rpc(json!({"op":"logs","run_id":a}));
+    let kinds: Vec<_> = log["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "run.submitted",
+            "run.started",
+            "run.model_requested",
+            "run.waiting_for_parent",
+            "run.resumed",
+            "run.started",
+            "run.model_requested",
+            "run.completed"
+        ]
+    );
+    assert_eq!(log["next_after_seq"], done["revision"]);
     assert_eq!(done["started_at_ms"], waiting["started_at_ms"]);
     assert!(done["revision"].as_i64() > waiting["revision"].as_i64());
     assert_eq!(
