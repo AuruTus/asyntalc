@@ -4,7 +4,7 @@ Status: Milestones 1–2 implemented; one-request live DeepSeek validation passe
 Based on [the v0.1 design](asyntalc-design-v0.1.md).
 Provider decision: an OpenAI-compatible Chat Completions API, with configurable endpoint and model.
 
-**Current verdict:** version 0.1.2 implements durable submission/retrieval, real Chat requests, successful conversation history, independent-session concurrency, per-session FIFO, cancellation, run deadlines, and submission idempotency. The CLI now validates the concurrent execution portion of v0.1. Parent questions/resume and operational list/log commands remain. See [section 13](#13-milestone-3-concurrent-durable-execution) for the current architecture, usage, and validation. Sections 10–12 retain historical milestone exhibitions.
+**Current verdict:** version 0.1.3 implements the async text executor plus independent-session concurrency, cancellation/deadlines, submission retries, persisted parent questions, and resume. See [section 14](#14-milestone-4-persisted-parent-interaction) for current architecture and validation. Operational list/log commands, workspace tools, and sandbox execution remain. Sections 10–13 retain prior milestone exhibitions.
 
 Sections 1–9 describe the target prototype, including work that remains unimplemented. The provider adapter now exists; the separate concurrent scheduler remains planned.
 
@@ -57,7 +57,7 @@ Use one OS-level exclusive lock per data directory, a private socket accessible 
 
 ## 3. CLI workflow
 
-The examples below specify the target CLI, not the current executable's exact syntax. The current binary accepts `daemon --config FILE` or `daemon --runner fake` and uses `wait --timeout-ms 20000`; it accepts `cancel --run ID` but does not accept `--timeout` or `resume`. Use section 13 for current scheduling behavior, section 10 for the historical fake exhibition, and section 12 for provider setup.
+The examples below specify the target CLI, not the current executable's exact syntax. The current binary accepts `daemon --config FILE` or `daemon --runner fake` and uses `wait --timeout-ms 20000`; it accepts `cancel --run ID` and `resume --run ID --question ID --input FILE`, but does not accept `--timeout`. Use section 13 for current scheduling behavior, section 10 for the historical fake exhibition, and section 12 for provider setup.
 
 ```bash
 # Terminal 1: daemon owns API credentials and provider configuration.
@@ -658,3 +658,81 @@ The local suite reports **32 passed, 0 failed, 1 ignored live test**: seven stor
 | Migration preserves durable data | Version-1 integration upgrade and version-2 store upgrade retain records and messages; foreign-key integrity and enforcement are checked. |
 
 **Verdict:** the CLI now behaves as intended for concurrent asynchronous execution: submit returns independently, sessions progress concurrently within limits, waits are bounded, and cancellation/deadlines/retries have durable semantics. It is still a text-generation executor, not the complete subagent swarm framework. Next is milestone 4: a persisted `ask_parent` question, `waiting_for_parent`, and `resume` with stale/duplicate answer handling. Milestone 5 adds paginated list/log inspection and retention decisions. Workspace tools and sandbox execution remain subsequent work.
+
+
+## 14. Milestone 4: persisted parent interaction
+
+Version **0.1.3**, schema **4**, protocol **1**. Enable `ask_parent = true` in the provider profile to advertise the one supported function. Text-only profiles retain the previous wire request and serialized session identity when the option is false or omitted. Changing it requires a new session and the usual compatible-daemon configuration for outstanding work.
+
+```mermaid
+stateDiagram-v2
+    queued --> running: claim session head
+    running --> waiting_for_parent: persist validated tool call and question
+    waiting_for_parent --> queued: persist answer and acknowledgement
+    waiting_for_parent --> cancelled: cancel
+    waiting_for_parent --> timed_out: original deadline expires
+    running --> completed: atomically commit full conversation
+    running --> failed: invalid call or execution failure
+```
+
+The parent question is produced only by a single validated `ask_parent` function call. Its prompt, optional choices, assistant message, provider call ID, and daemon-generated question ID persist together. `wait` returns `input_required`; `status` exposes the same pending `input_request`. Suggested choices allow free-text answers. Ordinary assistant prose remains a final text answer, even if it ends with a question mark.
+
+The scheduler releases the waiting run's execution slot while its original FIFO position blocks later turns in that session. Independent sessions continue, including with a one-slot global limit. Resume atomically records the answer and original acknowledgement, then makes the same run eligible. It preserves the original start time, deadline, and increasing revision. A scheduler exclusion guards a fast resume from reclaiming a run before the previous task exits.
+
+`src/store/parent.rs` reconstructs the current run's answered questions as assistant tool-call messages followed by matching `role: tool` results. Only final success commits the entire sequence to shared session history. Unsuccessful runs retain their question/answer audit records but contribute no conversation segment to later turns. The linking format and `parallel_tool_calls: false` follow the [official function-calling guide](https://developers.openai.com/api/docs/guides/function-calling); local validation still rejects multiple calls and unsupported tool names.
+
+### Usage exhibition
+
+Use a provider profile with `ask_parent = true`, a model that supports function calls, and a fresh session. Start its daemon using a separate private directory, then:
+
+```bash
+printf 'Use ask_parent to ask which CLI compatibility policy to use before drafting your proposal.' \
+  | ./target/debug/asyntalc --data-dir .asyntalc/parent submit --session review --input -
+# Substitute run_id from the receipt.
+./target/debug/asyntalc --data-dir .asyntalc/parent wait --run RUN_ID --timeout-ms 20000
+```
+
+A tool-using model yields a snapshot containing:
+
+```json
+{
+  "status": "waiting_for_parent",
+  "return_reason": "input_required",
+  "input_request": {
+    "question_id": "q_example",
+    "kind": "question",
+    "prompt": "Which CLI compatibility policy should I use?",
+    "choices": ["preserve", "redesign"],
+    "allows_free_text": true
+  }
+}
+```
+
+This is an illustrative subset of the snapshot. Function use is model-selected, not guaranteed by the prompt. With the IDs actually returned:
+
+```bash
+printf 'Preserve existing CLI flags and JSON fields.' \
+  | ./target/debug/asyntalc --data-dir .asyntalc/parent resume \
+      --run RUN_ID --question QUESTION_ID --input -
+./target/debug/asyntalc --data-dir .asyntalc/parent wait --run RUN_ID --timeout-ms 20000
+./target/debug/asyntalc --data-dir .asyntalc/parent result --run RUN_ID --output text
+```
+
+A further question may require another resume. Identical answer retries return the original acknowledgement, including after a later question or completion. A changed answer conflicts; a prior question cannot answer the current one. The original run deadline includes all parent waiting time. Acknowledged answers do not extend it.
+
+### Bounds, migration, and acceptance
+
+Question count is capped at eight and requests at nine per run. Question prompts are at most 8 KiB; optional choices have at most eight entries of 256 bytes each; serialized function arguments are at most 16 KiB. Answers use the existing nonempty 64 KiB input bound. Current question/answer content and tool metadata count against the context budget before another request. Unknown or overflowing cumulative token usage remains null. Waiting counts toward the 128-pending-run capacity but not active slots.
+
+Embedded migration 4 transactionally extends run states, adds typed tool metadata to messages, and adds the question/answer/acknowledgement table. Foreign keys are checked before commit. Schema-3 submission receipts and text-only profile identity survive the upgrade. No SQL files need to accompany a distributed executable. Restart preserves unexpired waiting questions and finalized answers; stopped or expired questions cannot resume.
+
+Validation: **41 local tests**, with the paid live test ignored. The previous 32 tests remain; nine added tests cover the following:
+
+- One-slot pause frees execution for an independent session while a same-session follower remains blocked; restart retains the exact question.
+- Resume sends the exact assistant call and linked answer, accumulates usage, and commits the whole successful sequence for the follower.
+- A second question cannot be answered by retrying the first; identical retries survive completion/restart; the real CLI reads answer files.
+- Cancellation before a question commits prevents suspension. Cancellation and deadline expiry while waiting reject new answers and do not poison session history.
+- Malformed arguments, unsupported/multiple tools, empty/oversized prompts, and excessive question count fail explicitly.
+- Store tests cover fast resume exclusion, pending capacity including waiting runs, context/turn bounds, profile mismatch, deadline checks at resume, and schema-3 retry compatibility.
+
+The tested behavior now includes v0.1's parent clarification/resume path. Live tool compatibility and model willingness to ask useful questions remain unvalidated. The next milestone is paginated `list` and `logs` for operational inspection, followed by workspace tools and sandbox execution. This clarification API grants no authority to execute those future tools.

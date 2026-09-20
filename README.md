@@ -2,13 +2,13 @@
 
 A Rust prototype of a durable local executor for asynchronous subagent tasks.
 
-**Version 0.1.2: concurrent durable execution.** Independent sessions can run concurrently with a configurable global limit, while each session keeps FIFO ordering. The CLI supports cancellation, durable run deadlines, and safe submission retries. The daemon can call an OpenAI-compatible Chat endpoint or use the development fake runner. Parent clarification, workspace tools, and sandbox execution remain future milestones.
+**Version 0.1.3: persisted parent questions and resume.** Independent sessions can run concurrently with a configurable global limit, while each session keeps FIFO ordering. The CLI supports cancellation, durable run deadlines, and safe submission retries. The daemon can call an OpenAI-compatible Chat endpoint or use the development fake runner. Opt-in parent clarification persists questions across restarts and resumes the same run. Workspace tools and sandbox execution remain future milestones.
 
-See the [design](docs/asyntalc-design-v0.1.md), [prototype plan](docs/asyntalc-prototype-plan.md), and [milestone 3 handoff](knowledge-base/milestone-3-concurrent-execution.md).
+See the [design](docs/asyntalc-design-v0.1.md), [prototype plan](docs/asyntalc-prototype-plan.md), and [milestone 4 handoff](knowledge-base/milestone-4-parent-interaction.md).
 
 ## Build and run
 
-Requirements: Linux, Rust 1.89 or newer, and a C toolchain for bundled SQLite. Version 0.1.2 was validated with Rust 1.98.1; the declared minimum version has not been tested separately.
+Requirements: Linux, Rust 1.89 or newer, and a C toolchain for bundled SQLite. Version 0.1.3 was validated with Rust 1.98.1; the declared minimum version has not been tested separately.
 
 ```bash
 cargo build --locked
@@ -30,7 +30,7 @@ echo 'Compare two queue designs' > /tmp/asyntalc-task.md
 
 Replace `RUN_ID` with the `run_id` from submission. Use the same data directory for every command; relative paths resolve from each process's working directory. Prompts can also come from stdin using `--input -`. An optional `--session NAME` reuses a session; otherwise submission allocates one.
 
-`submit` returns after SQLite commits acceptance, without waiting for execution. `status` reads the current state immediately. `wait` returns on completion, failure, cancellation, run deadline expiry, or its own timeout; timeout and client disconnection leave work running. If a wait returns `wait_timeout`, call `wait` again with the same run ID. The daemon defaults to two active runs; set `daemon --max-active-runs N` (1–64) to change this. Each session has at most one active run; eligible sessions rotate in durable dispatch order.
+`submit` returns after SQLite commits acceptance, without waiting for execution. `status` reads the current state immediately. `wait` returns on completion, failure, cancellation, run deadline expiry, a parent question, or its own timeout; timeout and client disconnection leave work running. If a wait returns `wait_timeout`, call `wait` again with the same run ID. The daemon defaults to two active runs; set `daemon --max-active-runs N` (1–64) to change this. Each session has at most one active run; eligible sessions rotate in durable dispatch order.
 
 For a follow-up, submit another prompt with `--session queue-review`. The daemon sends the stored successful user/assistant turns followed by the new prompt. A later queued prompt never appears in an earlier request. Failed turns, partial answers, and interrupted runs are retained for inspection but excluded from subsequent model context.
 
@@ -42,7 +42,7 @@ To demonstrate the lifecycle without credentials, use a separate directory:
 
 Point those clients at `.asyntalc/fake`. This runner echoes `[fake] <input>` and makes no API request. `--fake-delay-ms` remains available for demonstrations.
 
-On daemon restart with the same configuration, completed results remain available, unexpired queued runs continue, persisted stop requests are finalized, expired runs become `timed_out`, and other previously running work becomes `failed` with `daemon_interrupted`. Interrupted requests are not replayed automatically. Use Ctrl-C or SIGTERM to stop the daemon; startup handles stale sockets after an abrupt exit. Dropping the local HTTP request does not guarantee that remote generation or billing stops.
+On daemon restart with the same configuration, completed results remain available, unexpired queued runs continue, waiting questions remain available, persisted stop requests are finalized, expired runs become `timed_out`, and other previously running work becomes `failed` with `daemon_interrupted`. Interrupted requests are not replayed automatically. Use Ctrl-C or SIGTERM to stop the daemon; startup handles stale sockets after an abrupt exit. Dropping the local HTTP request does not guarantee that remote generation or billing stops.
 
 ## Cancellation, deadlines, and retries
 
@@ -60,15 +60,35 @@ A run deadline includes queue time and defaults to ten minutes from acceptance. 
 
 Idempotency keys are scoped to the data directory and retained with their run, without expiration in this prototype. The same key and identical input, session option, run timeout, and effective provider profile return the **original acceptance receipt**, even after completion or restart. Use `status` or `wait` for current state. A changed request returns `idempotency_conflict`. When the original request omitted `--session`, omit it on retries too; the stored receipt returns the same allocated session. Keys contain 1–128 ASCII letters, digits, or `_-.:`. A new request ID alone does not deduplicate a submission; retries without an idempotency key can create another run.
 
+## Parent questions and resume
+
+Set `ask_parent = true` under `[provider]` in a profile for a model supporting Chat Completions function calls. This changes the session profile, so use a new session; finish or cancel outstanding work before changing the daemon configuration, or use another data directory. Existing text-only profiles default to `false` and retain their stored identity.
+
+The daemon advertises one tool, `ask_parent({prompt, choices?})`. A validated call pauses the run as `waiting_for_parent`. `wait` returns immediately with `return_reason: "input_required"` and an `input_request` containing `question_id`, `prompt`, optional `choices`, and `allows_free_text: true`. A plain text question from the model does not suspend a run.
+
+```bash
+./target/debug/asyntalc wait --run RUN_ID --timeout-ms 20000
+printf 'Preserve the existing CLI' > /tmp/asyntalc-answer.md
+./target/debug/asyntalc resume --run RUN_ID --question QUESTION_ID \
+  --input /tmp/asyntalc-answer.md
+./target/debug/asyntalc wait --run RUN_ID --timeout-ms 20000
+```
+
+Replace both IDs from the snapshot and use the same data directory as your daemon. `resume` accepts a UTF-8 file or `--input -`; the answer may be free text even when choices are suggested. The acknowledgement records the same run requeued at its original FIFO position. Identical retries to that question return the original acknowledgement; changed answers return `answer_conflict`. A retry for an earlier answered question never answers a newer question. Unknown/mismatched question IDs return `question_not_found`; an unanswered question on a stopped run returns `run_not_waiting`.
+
+Waiting consumes no execution slot, but blocks later same-session runs and counts toward pending capacity. Cancellation and the original run deadline still apply. The assistant tool call and linked parent answer persist privately with the run; only final success commits the whole turn sequence to future session history. Questions are clarification requests, not permission for filesystem or shell tools. The fake runner remains an echo runner and does not generate questions.
+
+The tool/result message relationship follows the [official function-calling guide](https://developers.openai.com/api/docs/guides/function-calling). Local mock-server tests validate the request shape; live DeepSeek tool compatibility has not been tested.
+
 ## Provider configuration
 
-The [example TOML](examples/provider.toml) lists all fields. `base_url` includes the provider's API prefix; the daemon appends `/chat/completions`. Configure `instruction_role` as `system` or `developer`, and `output_token_parameter` as `max_tokens` or `max_completion_tokens`, according to the endpoint/model. Requests use `stream: false` and the default single response choice. Optional `reasoning_effort` is sent only when configured. This is a text-only compatibility subset; tool calls fail explicitly.
+The [example TOML](examples/provider.toml) lists all fields. `base_url` includes the provider's API prefix; the daemon appends `/chat/completions`. Configure `instruction_role` as `system` or `developer`, and `output_token_parameter` as `max_tokens` or `max_completion_tokens`, according to the endpoint/model. Requests use `stream: false` and the default single response choice. Optional `reasoning_effort` is sent only when configured. This supports text answers and the optional `ask_parent` control tool. Other tools and multiple calls in one turn fail explicitly.
 
 The user-selected first live provider is DeepSeek. [examples/deepseek.toml](examples/deepseek.toml) targets `https://api.deepseek.com` with `deepseek-flash`, `max_tokens`, and `reasoning_effort = "none"`, following the current [DeepSeek API reference](https://api-docs.deepseek.com/api/create-chat-completion/). The model choice is configurable. The one-request live smoke test passed on 2026-09-19 using an environment-provided credential.
 
 The daemon reads the named key environment variable at startup. It keeps the credential in memory, uses it as a bearer header, and stores only the non-secret profile in SQLite. HTTP redirects and automatic retries are disabled. Configuration and provider error diagnostics omit raw source lines and response bodies.
 
-Each session retains its complete non-secret profile, including model, URL, instructions, limits, and key-variable name. A submission reusing that session under different settings fails with `session_config_conflict`. Start a new session to change settings. Restart with the original configuration to continue queued work; startup rejects mismatched queued profiles. Credential values can rotate without changing session identity, but require a daemon restart to reload.
+Each session retains its complete non-secret profile, including model, URL, instructions, limits, and key-variable name. A submission reusing that session under different settings fails with `session_config_conflict`. Start a new session to change settings. Restart with the original configuration to continue queued work; startup rejects mismatched queued or waiting profiles. Credential values can rotate without changing session identity, but require a daemon restart to reload.
 
 This release supports one configured profile per daemon, supplied explicitly with `--config`. It does not yet implement layered project/user configuration or per-submission model overrides. The local `provider.toml` is ignored by Git.
 
@@ -101,11 +121,11 @@ Commands emit one JSON object on stdout by default; diagnostics use stderr. Only
 
 Receipts describe committed acceptance, so `queued` may already have changed by the time the client receives it. Snapshots carry a revision, phase, Unix-millisecond timestamps (`created_at_ms`, `started_at_ms`, `finished_at_ms`, `deadline_at_ms`), result metadata, and a typed run error when applicable. These timestamp names are an initial implementation detail; the plan's ISO timestamp examples are not implemented yet.
 
-`blocked_by_run_id` identifies the earliest unfinished predecessor in the same session, or is `null`; a global capacity wait has no blocking run ID. `cancellation_requested` reports a persisted client cancellation. Legacy terminal runs may have no deadline.
+`blocked_by_run_id` identifies the earliest unfinished predecessor in the same session, or is `null`; a global capacity wait has no blocking run ID. `cancellation_requested` reports a persisted client cancellation. `input_request` contains the pending parent question only while waiting; otherwise it is null. Legacy terminal runs may have no deadline.
 
-`return_reason` is `snapshot` for status and cancellation queries, and `terminal` or `wait_timeout` for waits. Status omits answer text. Wait includes at most 16 KiB of UTF-8 answer text and marks truncation; `result` retrieves the complete stored answer.
+`return_reason` is `snapshot` for status and cancellation queries, and `terminal`, `input_required`, or `wait_timeout` for waits. Status omits answer text. Wait includes at most 16 KiB of UTF-8 answer text and marks truncation; `result` retrieves the complete stored answer.
 
-Snapshots also include `usage.model_requests`, `usage.input_tokens`, and `usage.output_tokens`. Unreported token counts are `null`. Request counts record attempted initiation and are not a billing ledger. `phase` is `model_request` during a Chat API run. A valid final answer requires an assistant text response with `finish_reason: "stop"`.
+Snapshots also include `usage.model_requests`, `usage.input_tokens`, and `usage.output_tokens`. Unreported token counts are `null`. Request counts accumulate attempted initiation across resumes and are not a billing ledger. Token totals become null if any attempted turn has unknown usage or their sum cannot fit an integer. `phase` is `model_request` during a Chat API run. A valid final answer requires an assistant text response with `finish_reason: "stop"`.
 
 Failures are persisted as typed `run_error` values: authentication, rate limit, provider service/request errors, transport/timeout, malformed response, refusal/filtering, unsupported tools, and context/response/output limits. Output-limit failures can expose a bounded `partial_result` with `complete: false`; this is never returned by `result` as a successful final answer. The provider finish reason is retained when valid and available.
 
@@ -129,7 +149,10 @@ The local wire protocol is private. Each connection accepts one newline-terminat
 | Protocol frame | 1 MiB including terminating newline |
 | Active runs | 1–64, default 2; at most one per session |
 | Run lifetime | 1–86,400,000 ms, default 600,000 ms including queue time |
-| Pending runs | 128 queued/running runs |
+| Pending runs | 128 queued/running/waiting runs |
+| Parent questions per run | 8; at most 9 model requests including the final answer |
+| Parent question | Prompt up to 8 KiB; up to 8 choices of 256 bytes; arguments up to 16 KiB |
+| Parent answer | 64 KiB, nonempty UTF-8; subject to conversation context limit |
 | Connected handlers | 64; excess connections are closed |
 | Database work queue | 64 jobs |
 | Wait duration | 0–30,000 ms |
@@ -143,9 +166,9 @@ The local wire protocol is private. Each connection accepts one newline-terminat
 
 Context byte limits count message content, not model tokens or JSON encoding. Oversized history fails with `context_limit`; it is not silently truncated or summarized. A provider may impose a smaller token-based context window.
 
-The data directory must be private (0700); the socket is 0600. A filesystem lock prevents two daemons from owning the same directory. SQLite changes and their lifecycle events commit together. All three schema migrations are embedded in the executable; no SQL files need to accompany a distributed binary. Version-1 and version-2 databases upgrade to schema 3, preserving sessions, results, messages, and events. Each migration is transactional. Legacy pending runs receive a ten-minute deadline from migration time; historical terminal runs retain a null deadline. Older executables then reject that database as newer than supported. Unknown schema versions are rejected.
+The data directory must be private (0700); the socket is 0600. A filesystem lock prevents two daemons from owning the same directory. SQLite changes and their lifecycle events commit together. All four schema migrations are embedded in the executable; no SQL files need to accompany a distributed binary. Version-1 through version-3 databases upgrade to schema 4, preserving sessions, results, messages, and events. Each migration is transactional. Legacy pending runs receive a ten-minute deadline from migration time; historical terminal runs retain a null deadline. Older executables then reject that database as newer than supported. Unknown schema versions are rejected.
 
-This milestone does not implement parent questions/resume, log/list commands, retention, tool execution, or sandboxing.
+This milestone does not implement log/list commands, retention, workspace tools, or sandboxing.
 
 ## Validation
 
@@ -167,7 +190,7 @@ cargo test --locked --test client_daemon chat_provider::live_chat_smoke -- --ign
 
 The live test uses a temporary data directory and removes it afterward. It is ignored by default. Local adapter tests are not a substitute for checking compatibility with your actual endpoint and model.
 
-Version 0.1.2 validation on Rust/Cargo 1.98.1: 32 local tests passed; the paid live test stayed ignored. Formatting, the locked all-target build, and Clippy passed. The separately selected live DeepSeek test passed during milestone 2; no additional live request was made for this scheduler change. No dependency version change was needed for these checks. A package's newer major release is not by itself evidence that the locked version is incompatible with the compiler.
+Version 0.1.3 validation on Rust/Cargo 1.98.1: 41 local tests passed; the paid live test stayed ignored. Formatting, the locked all-target build, and Clippy passed. The separately selected live DeepSeek test passed during milestone 2; no additional live request was made for parent interaction. No dependency version change was needed for these checks. A package's newer major release is not by itself evidence that the locked version is incompatible with the compiler.
 
 ### rust-analyzer after a Rust upgrade
 
