@@ -4,7 +4,7 @@ Status: Milestones 1–2 implemented; one-request live DeepSeek validation passe
 Based on [the v0.1 design](asyntalc-design-v0.1.md).
 Provider decision: an OpenAI-compatible Chat Completions API, with configurable endpoint and model.
 
-**Current verdict:** version 0.1.3 implements the async text executor plus independent-session concurrency, cancellation/deadlines, submission retries, persisted parent questions, and resume. See [section 14](#14-milestone-4-persisted-parent-interaction) for current architecture and validation. Operational list/log commands, workspace tools, and sandbox execution remain. Sections 10–13 retain prior milestone exhibitions.
+**Current verdict:** version 0.1.4 completes the five planned milestones for the bounded async text prototype: durable client/daemon execution, Chat requests, concurrent sessions, parent questions/resume, and paginated run/event inspection. See [section 15](#15-milestone-5-run-discovery-and-lifecycle-inspection) for current usage and validation. This is still a subset of the broader v0.1 design: workspace tools, sandbox execution, and retention remain outside this prototype. Sections 10–14 preserve earlier milestone exhibitions.
 
 Sections 1–9 describe the target prototype, including work that remains unimplemented. The provider adapter now exists; the separate concurrent scheduler remains planned.
 
@@ -81,7 +81,7 @@ Support stdin through `--input -`. Make JSON the prototype default; `--output te
 
 `wait` blocks only the invocation that calls it, for a bounded time. The daemon continues eligible work. Even a host that invokes CLI tools sequentially can submit A, submit B, do local work, and then wait. In the target scheduler A and B can execute concurrently; in milestone 1 they execute serially while the parent remains free between client invocations. The host must choose when to wait—this executable cannot force the parent model to continue reasoning while its host blocks on a tool.
 
-Add `runs list --status ...` with pagination to rediscover handles after a parent restart. Add `logs --run ... --after-seq ... --limit ...` for finite event retrieval. Defer live JSONL streaming and `send` convenience mode until the core works.
+Use `list --status ...` with pagination to rediscover handles after a parent restart. Use `logs --run ... --after-seq ... --limit ...` for finite event retrieval. These are implemented in milestone 5; `list` is a top-level command to match the other run operations. Defer live JSONL streaming and `send` convenience mode until the core works.
 
 For larger swarms, the next interface extension should be bounded `wait --any --runs ...`, so one slow run does not delay noticing another run's question or completion. It is not required for the first two-run demonstration.
 
@@ -736,3 +736,64 @@ Validation: **41 local tests**, with the paid live test ignored. The previous 32
 - Store tests cover fast resume exclusion, pending capacity including waiting runs, context/turn bounds, profile mismatch, deadline checks at resume, and schema-3 retry compatibility.
 
 The tested behavior now includes v0.1's parent clarification/resume path. Live tool compatibility and model willingness to ask useful questions remain unvalidated. The next milestone is paginated `list` and `logs` for operational inspection, followed by workspace tools and sandbox execution. This clarification API grants no authority to execute those future tools.
+
+
+## 15. Milestone 5: run discovery and lifecycle inspection
+
+Version **0.1.4**, schema **4**, protocol **1**. This release adds read-only operations over existing run and event records; no migration or dependency change is needed.
+
+`src/store/inspection.rs` runs bounded queries on the same database worker that owns lifecycle transitions. List queries use durable queue positions, optional session/status predicates, and one extra row to determine `has_more`. Event queries use the existing `(run_id, sequence)` primary key. The CLI returns one finite JSON object; neither operation spawns an execution task or consumes a run slot.
+
+### Usage and output contract
+
+```bash
+# Discover current work or pending parent questions.
+asyntalc list --limit 50
+asyntalc list --session review --status waiting_for_parent --limit 20
+# Continue with next_after from the previous page, keeping the same filters.
+asyntalc list --after 42 --limit 50
+# Inspect one run's durable lifecycle; continue with next_after_seq.
+asyntalc logs --run RUN_ID --after-seq 0 --limit 50
+```
+
+Each command also accepts the existing global `--data-dir`. Pages use the usual protocol version, request ID, and `ok` envelope, plus:
+
+| Operation | Body |
+|---|---|
+| `list` | `runs`, `next_after`, `has_more` |
+| `logs` | `run_id`, `events`, `next_after_seq`, `has_more` |
+
+A run summary contains `queue_position`, run/session IDs, current status/revision, creation/start/finish/deadline timestamps, `error_code`, and a pending `question_id` or null. Prompt, question text, answers, profile, and credentials are absent. `status` supplies the current question/details; `result` supplies successful answer text.
+
+Events contain their per-run `sequence`, `kind`, and `created_at_ms`. For example, a successful question/resume run produces:
+
+```text
+run.submitted → run.started → run.model_requested
+→ run.waiting_for_parent → run.resumed → run.started
+→ run.model_requested → run.completed
+```
+
+Events record transitions and attempted requests. They are not raw provider logs or token streaming, and do not include question/answer content. Sequence numbers are monotonically increasing per run; consumers should not assume every historical sequence is present in imported/migrated data.
+
+Limits are 1–100 rows, default 50. Cursors are exclusive nonnegative integers; the returned cursor is the last delivered position/sequence, or the incoming cursor for an empty page. `has_more` indicates more matching rows at query time. Stop paging when false; use the last cursor for later event polling. Empty matching run lists are successful; logs for an unknown run return `run_not_found`. Invalid protocol filters/cursors/page sizes return typed errors, and invalid CLI choices exit 2.
+
+Pagination is a live view. Stable queue positions prevent duplicate positions when new runs arrive, but status changes may move an older run into a filter behind the cursor. Restart the scan at zero to refresh pending questions or failures. Cursors are meaningful only for the same data directory and, for logs, the same run. They do not encode filters or authenticate callers; the local socket is the access boundary.
+
+### Reproducible exhibition and validation
+
+```bash
+cargo build --locked
+bash examples/inspect-demo.sh
+```
+
+The [inspection demo](../examples/inspect-demo.sh) uses a private temporary directory and the fake runner. It demonstrates idempotent submission, handle discovery without reading the receipt, two run-list pages, bounded wait, exact result retrieval, and event pagination. Python assertions verify the IDs, cursor progression, terminal result, and event sequence. The daemon stops on script exit; the script prints the evidence directory for inspection. The test suite runs the same script with a disposable directory. Bash and Python 3 are required for this demo/test; the Rust binary does not require them.
+
+The full local suite reports **45 passed, 0 failed, 1 ignored live test**, with formatting, Clippy, and the locked build checked. Four new tests exercise list pagination across inserts/restart, status/session filtering, event polling across cancellation/restart, CLI/error/frame bounds with a 100-item page, and the demo. Existing parent tests now verify discovery of a waiting question and the exact resume event sequence. No live API request was made.
+
+The milestone-4 test stall is documented in its handoff; it was not reproduced in this milestone's first full-suite run. It remains an unconfirmed observation rather than a claimed fixed deadlock.
+
+### Completion boundary and next work
+
+The five-milestone text prototype is now usable through the CLI: submit → discover → wait → answer a parent question if needed → collect result → inspect lifecycle. Earlier tests retain coverage for independent-session overlap, FIFO, multiple waiters, bounded waits, cancellation/deadline races, durable retries, and interrupted-run recovery. Real text requests were smoke-tested against DeepSeek in milestone 2; parent function-call compatibility has only local mock-server evidence.
+
+No automatic retention or deletion is introduced. Runs, events, questions, and submit/resume receipts persist together; deleting them would change retry guarantees and needs a defined policy. The broader v0.1 design still needs workspace access, tool execution and sandbox isolation, plus its deferred convenience/configuration features. The next implementation slice should define read-only workspace access and its boundary before enabling file mutation or shell execution.

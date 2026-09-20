@@ -2,13 +2,13 @@
 
 A Rust prototype of a durable local executor for asynchronous subagent tasks.
 
-**Version 0.1.3: persisted parent questions and resume.** Independent sessions can run concurrently with a configurable global limit, while each session keeps FIFO ordering. The CLI supports cancellation, durable run deadlines, and safe submission retries. The daemon can call an OpenAI-compatible Chat endpoint or use the development fake runner. Opt-in parent clarification persists questions across restarts and resumes the same run. Workspace tools and sandbox execution remain future milestones.
+**Version 0.1.4: run discovery and lifecycle inspection.** Independent sessions can run concurrently with a configurable global limit, while each session keeps FIFO ordering. The CLI supports cancellation, durable run deadlines, and safe submission retries. The daemon can call an OpenAI-compatible Chat endpoint or use the development fake runner. Opt-in parent clarification persists questions across restarts and resumes the same run. Workspace tools and sandbox execution remain future milestones.
 
-See the [design](docs/asyntalc-design-v0.1.md), [prototype plan](docs/asyntalc-prototype-plan.md), and [milestone 4 handoff](knowledge-base/milestone-4-parent-interaction.md).
+See the [design](docs/asyntalc-design-v0.1.md), [prototype plan](docs/asyntalc-prototype-plan.md), and [milestone 5 handoff](knowledge-base/milestone-5-inspection.md).
 
 ## Build and run
 
-Requirements: Linux, Rust 1.89 or newer, and a C toolchain for bundled SQLite. Version 0.1.3 was validated with Rust 1.98.1; the declared minimum version has not been tested separately.
+Requirements: Linux, Rust 1.89 or newer, and a C toolchain for bundled SQLite. Version 0.1.4 was validated with Rust 1.98.1; the declared minimum version has not been tested separately.
 
 ```bash
 cargo build --locked
@@ -59,6 +59,30 @@ A run deadline includes queue time and defaults to ten minutes from acceptance. 
 `cancel` returns the current snapshot. Queued work stops immediately; active work may return `running` with `cancellation_requested: true` and phase `cancelling`, then becomes `cancelled` after the local request is dropped. Use `wait` for the terminal state. Repeated cancellation is harmless. Completion, cancellation, and deadline decisions are serialized in SQLite: an already committed terminal result never changes, and a persisted stop decision prevents a late answer from entering session history. Local cancellation cannot guarantee cancellation or prevent billing at the remote provider.
 
 Idempotency keys are scoped to the data directory and retained with their run, without expiration in this prototype. The same key and identical input, session option, run timeout, and effective provider profile return the **original acceptance receipt**, even after completion or restart. Use `status` or `wait` for current state. A changed request returns `idempotency_conflict`. When the original request omitted `--session`, omit it on retries too; the stored receipt returns the same allocated session. Keys contain 1–128 ASCII letters, digits, or `_-.:`. A new request ID alone does not deduplicate a submission; retries without an idempotency key can create another run.
+
+## Discover runs and inspect events
+
+```bash
+./target/debug/asyntalc list --limit 50
+./target/debug/asyntalc list --session queue-review --status waiting_for_parent
+./target/debug/asyntalc list --after CURSOR --limit 50
+./target/debug/asyntalc logs --run RUN_ID --after-seq 0 --limit 50
+```
+
+`list` returns compact run summaries in ascending submission order. Use `next_after` as the next `--after` with the same filters while `has_more` is true. Summaries contain IDs, queue position, current status/revision, timestamps, error code, and pending question ID. Use `status` to read the question or `result` to retrieve the answer.
+
+`logs` returns durable lifecycle events in ascending per-run sequence order. Each event contains `sequence`, `kind`, and `created_at_ms`. Continue with `next_after_seq` as `--after-seq`. An empty page preserves the supplied cursor, so a caller can poll again later. These are lifecycle events, not raw HTTP logs or conversation transcripts. Missing runs return `run_not_found`.
+
+Both commands default to 50 items and accept 1–100. Cursors are exclusive nonnegative integers, scoped to this data directory (`list`) or run (`logs`). `has_more: false` means no further matches at query time. Pages reflect live state, not a frozen multi-page snapshot: new submissions can appear on later pages, and older runs can change status behind your cursor. Restart from `--after 0` to refresh a status-filtered view, especially pending questions. Neither command follows events continuously.
+
+For a self-checking demo with no credentials:
+
+```bash
+cargo build --locked
+bash examples/inspect-demo.sh
+```
+
+The demo requires Bash and Python 3. It submits/retries work, rediscovers handles through pagination, retrieves a result, checks lifecycle logs, and stops its daemon. It prints the temporary directory containing JSON evidence and SQLite. Records are retained; this prototype has no deletion or automatic retention policy.
 
 ## Parent questions and resume
 
@@ -149,6 +173,7 @@ The local wire protocol is private. Each connection accepts one newline-terminat
 | Protocol frame | 1 MiB including terminating newline |
 | Active runs | 1–64, default 2; at most one per session |
 | Run lifetime | 1–86,400,000 ms, default 600,000 ms including queue time |
+| Inspection page | 1–100 items, default 50; compact summaries/events only |
 | Pending runs | 128 queued/running/waiting runs |
 | Parent questions per run | 8; at most 9 model requests including the final answer |
 | Parent question | Prompt up to 8 KiB; up to 8 choices of 256 bytes; arguments up to 16 KiB |
@@ -168,7 +193,7 @@ Context byte limits count message content, not model tokens or JSON encoding. Ov
 
 The data directory must be private (0700); the socket is 0600. A filesystem lock prevents two daemons from owning the same directory. SQLite changes and their lifecycle events commit together. All four schema migrations are embedded in the executable; no SQL files need to accompany a distributed binary. Version-1 through version-3 databases upgrade to schema 4, preserving sessions, results, messages, and events. Each migration is transactional. Legacy pending runs receive a ten-minute deadline from migration time; historical terminal runs retain a null deadline. Older executables then reject that database as newer than supported. Unknown schema versions are rejected.
 
-This milestone does not implement log/list commands, retention, workspace tools, or sandboxing.
+This milestone does not implement retention/deletion, continuous log streaming, workspace tools, or sandboxing. Records and retry receipts remain in the data directory until it is managed externally while the daemon is stopped.
 
 ## Validation
 
@@ -190,7 +215,7 @@ cargo test --locked --test client_daemon chat_provider::live_chat_smoke -- --ign
 
 The live test uses a temporary data directory and removes it afterward. It is ignored by default. Local adapter tests are not a substitute for checking compatibility with your actual endpoint and model.
 
-Version 0.1.3 validation on Rust/Cargo 1.98.1: 41 local tests passed; the paid live test stayed ignored. Formatting, the locked all-target build, and Clippy passed. The separately selected live DeepSeek test passed during milestone 2; no additional live request was made for parent interaction. No dependency version change was needed for these checks. A package's newer major release is not by itself evidence that the locked version is incompatible with the compiler.
+Version 0.1.4 validation on Rust/Cargo 1.98.1: 45 local tests passed; the paid live test stayed ignored. Formatting, the locked all-target build, and Clippy passed. The separately selected live DeepSeek test passed during milestone 2; no additional live request was made for inspection commands. The local suite also runs the Bash/Python inspection demo. No dependency version change was needed for these checks. A package's newer major release is not by itself evidence that the locked version is incompatible with the compiler.
 
 ### rust-analyzer after a Rust upgrade
 
