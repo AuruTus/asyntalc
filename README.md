@@ -2,13 +2,13 @@
 
 A Rust prototype of a durable local executor for asynchronous subagent tasks.
 
-**Version 0.1.1: OpenAI-compatible Chat Completions and persistent conversation history.** The daemon can call a configured endpoint or use the development fake runner. Execution remains serial; concurrent sessions, cancellation, parent clarification, workspace tools, and sandbox execution are later milestones.
+**Version 0.1.2: concurrent durable execution.** Independent sessions can run concurrently with a configurable global limit, while each session keeps FIFO ordering. The CLI supports cancellation, durable run deadlines, and safe submission retries. The daemon can call an OpenAI-compatible Chat endpoint or use the development fake runner. Parent clarification, workspace tools, and sandbox execution remain future milestones.
 
-See the [design](docs/asyntalc-design-v0.1.md), [prototype plan](docs/asyntalc-prototype-plan.md), and [milestone 2 handoff](knowledge-base/milestone-2-chat-provider.md).
+See the [design](docs/asyntalc-design-v0.1.md), [prototype plan](docs/asyntalc-prototype-plan.md), and [milestone 3 handoff](knowledge-base/milestone-3-concurrent-execution.md).
 
 ## Build and run
 
-Requirements: Linux, Rust 1.89 or newer, and a C toolchain for bundled SQLite. Version 0.1.1 was validated with Rust 1.98.1; the declared minimum version has not been tested separately.
+Requirements: Linux, Rust 1.89 or newer, and a C toolchain for bundled SQLite. Version 0.1.2 was validated with Rust 1.98.1; the declared minimum version has not been tested separately.
 
 ```bash
 cargo build --locked
@@ -30,7 +30,7 @@ echo 'Compare two queue designs' > /tmp/asyntalc-task.md
 
 Replace `RUN_ID` with the `run_id` from submission. Use the same data directory for every command; relative paths resolve from each process's working directory. Prompts can also come from stdin using `--input -`. An optional `--session NAME` reuses a session; otherwise submission allocates one.
 
-`submit` returns after SQLite commits acceptance, without waiting for execution. `status` reads the current state immediately. `wait` returns on completion, failure, or its own timeout; timeout and client disconnection leave work running. If a wait returns `wait_timeout`, call `wait` again with the same run ID. Execution remains one run at a time in submission order.
+`submit` returns after SQLite commits acceptance, without waiting for execution. `status` reads the current state immediately. `wait` returns on completion, failure, cancellation, run deadline expiry, or its own timeout; timeout and client disconnection leave work running. If a wait returns `wait_timeout`, call `wait` again with the same run ID. The daemon defaults to two active runs; set `daemon --max-active-runs N` (1–64) to change this. Each session has at most one active run; eligible sessions rotate in durable dispatch order.
 
 For a follow-up, submit another prompt with `--session queue-review`. The daemon sends the stored successful user/assistant turns followed by the new prompt. A later queued prompt never appears in an earlier request. Failed turns, partial answers, and interrupted runs are retained for inspection but excluded from subsequent model context.
 
@@ -42,7 +42,23 @@ To demonstrate the lifecycle without credentials, use a separate directory:
 
 Point those clients at `.asyntalc/fake`. This runner echoes `[fake] <input>` and makes no API request. `--fake-delay-ms` remains available for demonstrations.
 
-On daemon restart with the same configuration, completed results remain available, queued runs continue, and previously running work becomes `failed` with `daemon_interrupted`. Interrupted requests are not replayed automatically. Use Ctrl-C or SIGTERM to stop the daemon; startup handles stale sockets after an abrupt exit. Dropping the local HTTP request does not guarantee that remote generation or billing stops.
+On daemon restart with the same configuration, completed results remain available, unexpired queued runs continue, persisted stop requests are finalized, expired runs become `timed_out`, and other previously running work becomes `failed` with `daemon_interrupted`. Interrupted requests are not replayed automatically. Use Ctrl-C or SIGTERM to stop the daemon; startup handles stale sockets after an abrupt exit. Dropping the local HTTP request does not guarantee that remote generation or billing stops.
+
+## Cancellation, deadlines, and retries
+
+```bash
+# Retry this exact submission with the same key if its reply is lost.
+./target/debug/asyntalc submit --session review --input /tmp/asyntalc-task.md \
+  --idempotency-key review-001 --run-timeout-ms 600000
+./target/debug/asyntalc cancel --run RUN_ID
+./target/debug/asyntalc wait --run RUN_ID --timeout-ms 20000
+```
+
+A run deadline includes queue time and defaults to ten minutes from acceptance. `--run-timeout-ms` accepts 1–86,400,000 ms. It is independent of the provider's HTTP timeout and the client's bounded wait. Deadlines persist through restarts and use Unix wall-clock time.
+
+`cancel` returns the current snapshot. Queued work stops immediately; active work may return `running` with `cancellation_requested: true` and phase `cancelling`, then becomes `cancelled` after the local request is dropped. Use `wait` for the terminal state. Repeated cancellation is harmless. Completion, cancellation, and deadline decisions are serialized in SQLite: an already committed terminal result never changes, and a persisted stop decision prevents a late answer from entering session history. Local cancellation cannot guarantee cancellation or prevent billing at the remote provider.
+
+Idempotency keys are scoped to the data directory and retained with their run, without expiration in this prototype. The same key and identical input, session option, run timeout, and effective provider profile return the **original acceptance receipt**, even after completion or restart. Use `status` or `wait` for current state. A changed request returns `idempotency_conflict`. When the original request omitted `--session`, omit it on retries too; the stored receipt returns the same allocated session. Keys contain 1–128 ASCII letters, digits, or `_-.:`. A new request ID alone does not deduplicate a submission; retries without an idempotency key can create another run.
 
 ## Provider configuration
 
@@ -78,13 +94,16 @@ Commands emit one JSON object on stdout by default; diagnostics use stderr. Only
   "run_id": "run_example",
   "session_id": "session_example",
   "status": "queued",
-  "revision": 1
+  "revision": 1,
+  "deadline_at_ms": 1790000600000
 }
 ```
 
-Receipts describe committed acceptance, so `queued` may already have changed by the time the client receives it. Snapshots carry a revision, phase, Unix-millisecond timestamps (`created_at_ms`, `started_at_ms`, `finished_at_ms`), result metadata, and a typed run error when applicable. These timestamp names are an initial implementation detail; the plan's ISO timestamp examples are not implemented yet.
+Receipts describe committed acceptance, so `queued` may already have changed by the time the client receives it. Snapshots carry a revision, phase, Unix-millisecond timestamps (`created_at_ms`, `started_at_ms`, `finished_at_ms`, `deadline_at_ms`), result metadata, and a typed run error when applicable. These timestamp names are an initial implementation detail; the plan's ISO timestamp examples are not implemented yet.
 
-`return_reason` is `snapshot` for status queries, and `terminal` or `wait_timeout` for waits. Status omits answer text. Wait includes at most 16 KiB of UTF-8 answer text and marks truncation; `result` retrieves the complete stored answer.
+`blocked_by_run_id` identifies the earliest unfinished predecessor in the same session, or is `null`; a global capacity wait has no blocking run ID. `cancellation_requested` reports a persisted client cancellation. Legacy terminal runs may have no deadline.
+
+`return_reason` is `snapshot` for status and cancellation queries, and `terminal` or `wait_timeout` for waits. Status omits answer text. Wait includes at most 16 KiB of UTF-8 answer text and marks truncation; `result` retrieves the complete stored answer.
 
 Snapshots also include `usage.model_requests`, `usage.input_tokens`, and `usage.output_tokens`. Unreported token counts are `null`. Request counts record attempted initiation and are not a billing ledger. `phase` is `model_request` during a Chat API run. A valid final answer requires an assistant text response with `finish_reason: "stop"`.
 
@@ -92,7 +111,7 @@ Failures are persisted as typed `run_error` values: authentication, rate limit, 
 
 Exit codes:
 
-- `0`: the command succeeded, including a snapshot of a failed run or a wait timeout. Inspect `status` to decide whether the task succeeded.
+- `0`: the command succeeded, including a snapshot of a failed, cancelled, or timed-out run, or a wait timeout. Inspect `status` to decide whether the task succeeded.
 - `1`: input, connection, protocol, or command failure. JSON mode returns an error object when possible.
 - `2`: invalid command-line arguments; usage diagnostics go to stderr.
 
@@ -108,6 +127,8 @@ The local wire protocol is private. Each connection accepts one newline-terminat
 |---|---|
 | Input | 64 KiB, nonempty UTF-8 |
 | Protocol frame | 1 MiB including terminating newline |
+| Active runs | 1–64, default 2; at most one per session |
+| Run lifetime | 1–86,400,000 ms, default 600,000 ms including queue time |
 | Pending runs | 128 queued/running runs |
 | Connected handlers | 64; excess connections are closed |
 | Database work queue | 64 jobs |
@@ -122,9 +143,9 @@ The local wire protocol is private. Each connection accepts one newline-terminat
 
 Context byte limits count message content, not model tokens or JSON encoding. Oversized history fails with `context_limit`; it is not silently truncated or summarized. A provider may impose a smaller token-based context window.
 
-The data directory must be private (0700); the socket is 0600. A filesystem lock prevents two daemons from owning the same directory. SQLite changes and their lifecycle events commit together. Both schema migrations are embedded in the executable. Version-1 databases upgrade transactionally to version 2, preserving old fake results and binding legacy sessions to the fake profile. Older executables then reject that database as newer than supported. Unknown schema versions are rejected.
+The data directory must be private (0700); the socket is 0600. A filesystem lock prevents two daemons from owning the same directory. SQLite changes and their lifecycle events commit together. All three schema migrations are embedded in the executable; no SQL files need to accompany a distributed binary. Version-1 and version-2 databases upgrade to schema 3, preserving sessions, results, messages, and events. Each migration is transactional. Legacy pending runs receive a ten-minute deadline from migration time; historical terminal runs retain a null deadline. Older executables then reject that database as newer than supported. Unknown schema versions are rejected.
 
-This milestone does not implement parallel session execution, idempotency keys, cancellation, durable run deadlines, parent questions, log/list commands, retention, tool execution, or sandboxing. Avoid blindly retrying an ambiguous submission until idempotency is added.
+This milestone does not implement parent questions/resume, log/list commands, retention, tool execution, or sandboxing.
 
 ## Validation
 
@@ -146,7 +167,7 @@ cargo test --locked --test client_daemon chat_provider::live_chat_smoke -- --ign
 
 The live test uses a temporary data directory and removes it afterward. It is ignored by default. Local adapter tests are not a substitute for checking compatibility with your actual endpoint and model.
 
-Latest validation on Rust/Cargo 1.98.1: 18 local tests passed, and the separately selected live DeepSeek test passed. The locked all-target build and Clippy passed. No dependency version change was needed for these checks. A package's newer major release is not by itself evidence that the locked version is incompatible with the compiler.
+Version 0.1.2 validation on Rust/Cargo 1.98.1: 32 local tests passed; the paid live test stayed ignored. Formatting, the locked all-target build, and Clippy passed. The separately selected live DeepSeek test passed during milestone 2; no additional live request was made for this scheduler change. No dependency version change was needed for these checks. A package's newer major release is not by itself evidence that the locked version is incompatible with the compiler.
 
 ### rust-analyzer after a Rust upgrade
 

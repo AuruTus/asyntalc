@@ -4,7 +4,7 @@ Status: Milestones 1–2 implemented; one-request live DeepSeek validation passe
 Based on [the v0.1 design](asyntalc-design-v0.1.md).
 Provider decision: an OpenAI-compatible Chat Completions API, with configurable endpoint and model.
 
-**Current verdict:** the CLI implements durable submission and retrieval, real OpenAI-compatible HTTP requests, and persisted successful conversation history. The original fake runner remains available. Task execution is still serial; parallel sessions, cancellation, and parent questions remain unimplemented. See [section 12](#12-milestone-2-real-chat-requests-and-session-history) for the current architecture and validation boundary. Sections 10–11 retain the milestone 1 exhibition and historical comparison.
+**Current verdict:** version 0.1.2 implements durable submission/retrieval, real Chat requests, successful conversation history, independent-session concurrency, per-session FIFO, cancellation, run deadlines, and submission idempotency. The CLI now validates the concurrent execution portion of v0.1. Parent questions/resume and operational list/log commands remain. See [section 13](#13-milestone-3-concurrent-durable-execution) for the current architecture, usage, and validation. Sections 10–12 retain historical milestone exhibitions.
 
 Sections 1–9 describe the target prototype, including work that remains unimplemented. The provider adapter now exists; the separate concurrent scheduler remains planned.
 
@@ -57,7 +57,7 @@ Use one OS-level exclusive lock per data directory, a private socket accessible 
 
 ## 3. CLI workflow
 
-The examples below specify the target CLI, not the current executable's exact syntax. The current binary accepts `daemon --config FILE` or `daemon --runner fake` and uses `wait --timeout-ms 20000`; it does not accept `--timeout`, `resume`, or `cancel`. Use section 10 for the fake exhibition and section 12 for real-provider setup.
+The examples below specify the target CLI, not the current executable's exact syntax. The current binary accepts `daemon --config FILE` or `daemon --runner fake` and uses `wait --timeout-ms 20000`; it accepts `cancel --run ID` but does not accept `--timeout` or `resume`. Use section 13 for current scheduling behavior, section 10 for the historical fake exhibition, and section 12 for provider setup.
 
 ```bash
 # Terminal 1: daemon owns API credentials and provider configuration.
@@ -291,7 +291,7 @@ A submission commits a queued run and its event before returning its receipt. Th
 
 ### Copy-and-run demonstration
 
-Run this Bash block from the repository root. It requires the Rust build prerequisites and Python 3's standard library for JSON parsing/assertions, but no API key. It uses an isolated directory, verifies both answers and serial execution, and leaves JSON evidence plus SQLite there for inspection. A trap stops only the daemon launched by this example.
+Run this Bash block from the repository root. It requires the Rust build prerequisites and Python 3's standard library for JSON parsing/assertions, but no API key. It uses an isolated directory and explicitly selects one execution slot to reproduce the milestone 1 baseline, verifies both answers and serial execution, and leaves JSON evidence plus SQLite there for inspection. A trap stops only the daemon launched by this example.
 
 ```bash
 set -euo pipefail
@@ -300,7 +300,7 @@ demo_bin="$PWD/target/debug/asyntalc"
 demo_dir="$(mktemp -d /tmp/asyntalc-demo.XXXXXX)"
 
 start_demo_daemon() {
-  "$demo_bin" --data-dir "$demo_dir" daemon --runner fake --fake-delay-ms 3000 \
+  "$demo_bin" --data-dir "$demo_dir" daemon --runner fake --max-active-runs 1 --fake-delay-ms 3000 \
     >"$demo_dir/daemon.stdout" 2>"$demo_dir/daemon.stderr" &
   demo_pid=$!
   for attempt in {1..50}; do
@@ -550,6 +550,111 @@ The local HTTP tests gate responses to inspect exact requests while a run is act
 
 The baseline remains the eight milestone 1 tests; the added provider tests exercise the same lifecycle through HTTP. The version 0.1.1 local suite reports **18 passed, 0 failed, and 1 ignored live test**; formatting and Clippy checks pass with Rust 1.98.1. This is functional validation, not a throughput benchmark or model-quality comparison. Full results and resumption instructions are recorded in the [milestone 2 handoff](../knowledge-base/milestone-2-chat-provider.md).
 
-Still outstanding for the first useful v0.1 slice: independent-session concurrency, explicit cancellation, durable deadlines, submission idempotency, parent clarification/resume, and run listing/log inspection. Tools and sandbox execution follow those lifecycle milestones. The basic DeepSeek integration is live-verified; concurrency and cancellation are the next implementation milestone.
+At the end of milestone 2, the outstanding work was: independent-session concurrency, explicit cancellation, durable deadlines, submission idempotency, parent clarification/resume, and run listing/log inspection. Tools and sandbox execution follow those lifecycle milestones. The basic DeepSeek integration is live-verified; concurrency and cancellation are the next implementation milestone.
 
 The checked-in DeepSeek profile now omits repeated defaults while preserving the effective settings used for validation. Only endpoint, model, and key-variable name are required; other entries are optional overrides. Configuration is trusted input because it selects the destination for both the credential and conversation. Neither configuration nor SQLite provides encryption, and private instructions should not be committed. See the [configuration safety discussion](../README.md#configuration-size-and-safety).
+
+
+## 13. Milestone 3: concurrent durable execution
+
+Version **0.1.2**, schema **3**, wire protocol **1**. New submit fields have defaults, so existing protocol-1 submissions remain accepted. The original immutable v0.1 design remains the target; this section records the implemented subset.
+
+### Architecture and lifecycle
+
+```mermaid
+flowchart LR
+    C[Short-lived CLI processes] -->|Unix socket JSON| D[Daemon request handlers]
+    D -->|Atomic submit / cancel / snapshots| DB[(SQLite worker)]
+    D -->|Wake| S[Concurrent scheduler]
+    S -->|Claim eligible session heads| DB
+    S --> A[Run A future]
+    S --> B[Run B future]
+    A --> P[Chat API or fake runner]
+    B --> P
+    A -->|Commit outcome and successful history| DB
+    B -->|Commit outcome and successful history| DB
+    DB -->|Persist deadlines and stop decisions| S
+    S -->|State notification| D
+```
+
+[`src/scheduler.rs`](../src/scheduler.rs) owns a bounded set of run tasks, default two and configurable with `--max-active-runs 1..64`. Session dispatch order is stored in SQLite; eligible sessions rotate, and each claim selects only that session's oldest unfinished run. A partial unique database index also prevents two running records in one session. A queued predecessor blocks later turns until it is terminal. Independent sessions can overlap; a global slot limit still bounds concurrency. This is fair session dispatch, not a provider token/rate limiter.
+
+[`src/store.rs`](../src/store.rs) serializes lifecycle transitions on its existing database thread. Queued cancellations and expired queued deadlines terminalize immediately. An active stop first persists its reason and event, keeping the run `running` and its session occupied. The scheduler signals its task to drop the local HTTP future; cleanup then commits `cancelled` or `timed_out`. Completion and failure commits recheck the durable stop decision and deadline. A late response cannot overwrite the winning decision or append unsuccessful history. Successful completion still commits its result and user/assistant messages together.
+
+The scheduler drains its run tasks and accepted database work before daemon shutdown releases the ownership lock. Restart retains successful results, finalizes recorded stops and expired deadlines, resumes unexpired queued work, and marks other formerly active work `daemon_interrupted` without replaying requests.
+
+[`migrations/003_scheduler.sql`](../migrations/003_scheduler.sql) is compiled into the binary. Its transactional table rebuild preserves IDs, queue positions, messages, and events while adding terminal states, deadlines, stop reasons, dispatch order, and submission receipts. Foreign keys are checked before commit and re-enabled afterward. Migrated pending runs get ten minutes from upgrade time; historical terminal runs have no retrospective deadline. Ship the executable alone; schema version 3 is independent of protocol version 1. Earlier binaries reject the upgraded database.
+
+### CLI usage and returned content
+
+Start the daemon in terminal 1:
+
+```bash
+cargo build --locked
+./target/debug/asyntalc --data-dir .asyntalc/m3 daemon \
+  --runner fake --max-active-runs 2 --fake-delay-ms 30000
+```
+
+In terminal 2, submit three runs, retaining each returned `run_id`:
+
+```bash
+printf 'First turn for A' | ./target/debug/asyntalc --data-dir .asyntalc/m3 submit \
+  --session demo-a --input - --idempotency-key demo-a-1
+printf 'Second turn for A' | ./target/debug/asyntalc --data-dir .asyntalc/m3 submit \
+  --session demo-a --input - --idempotency-key demo-a-2
+printf 'Independent turn for B' | ./target/debug/asyntalc --data-dir .asyntalc/m3 submit \
+  --session demo-b --input - --idempotency-key demo-b-1
+```
+
+During the fake delay, A1 and B1 can be `running`; A2 remains `queued` with `blocked_by_run_id` equal to A1. Replace the placeholders with the returned IDs:
+
+```bash
+./target/debug/asyntalc --data-dir .asyntalc/m3 status --run A2_RUN_ID
+./target/debug/asyntalc --data-dir .asyntalc/m3 wait --run B1_RUN_ID --timeout-ms 0
+./target/debug/asyntalc --data-dir .asyntalc/m3 cancel --run A1_RUN_ID
+./target/debug/asyntalc --data-dir .asyntalc/m3 wait --run A1_RUN_ID --timeout-ms 20000
+./target/debug/asyntalc --data-dir .asyntalc/m3 status --run A2_RUN_ID
+```
+
+A2 becomes eligible after A1 cleanup. B1 continues independently. Run this promptly or increase the fake delay up to its 30-second maximum; timing-free HTTP validation below establishes the same behavior using response gates. Re-running an identical submission with the same key returns the same acceptance receipt, not another task. For a fresh demonstration, use a fresh data directory or new session names and keys.
+
+To demonstrate a deadline shorter than fake execution:
+
+```bash
+printf 'Expire this task' | ./target/debug/asyntalc --data-dir .asyntalc/m3 submit \
+  --session demo-deadline --input - --run-timeout-ms 1000
+# Use its run_id below; the deadline applies even if all execution slots are occupied.
+./target/debug/asyntalc --data-dir .asyntalc/m3 wait --run DEADLINE_RUN_ID --timeout-ms 20000
+```
+
+The wait returns `status: "timed_out"`, `return_reason: "terminal"`, and `run_error.code: "timed_out"`. By comparison, `--timeout-ms 0` merely takes a snapshot; `return_reason: "wait_timeout"` never stops a task.
+
+| Command or field | Implemented meaning |
+|---|---|
+| `submit` | Durable receipt: run/session IDs, original `queued` status/revision, absolute `deadline_at_ms`. |
+| `--idempotency-key` | Directory-scoped key; identical input, session option, timeout duration, and effective profile return the original receipt. Changes return `idempotency_conflict`. Defaults are normalized. Omitted sessions stay omitted on retries. |
+| `--run-timeout-ms` | 1–86,400,000 ms, default 600,000, from first acceptance including queue time. Retry does not extend it. |
+| `status` / `wait` | Current status/revision, phase, timestamps, usage, result/error metadata, `cancellation_requested`, and `blocked_by_run_id`. |
+| `blocked_by_run_id` | Earliest unfinished predecessor in the same session, or null; global slot contention has no single blocking ID. |
+| `cancel` | Current snapshot after recording cancellation; active cleanup may still be running. Repeated calls and cancellation after completion preserve terminal state. |
+| `cancelling` / `timing_out` phase | Active execution is stopping; terminal status follows cleanup. |
+| `wait` | Returns on all four terminal statuses: `completed`, `failed`, `cancelled`, `timed_out`; successful command exit does not imply successful task. |
+| `result` | Full successful answer only. Unsuccessful terminal runs return `result_not_ready`; inspect their snapshot for the error. |
+
+Keys have no expiry or pruning yet. Receipts do not promise exactly-once provider generation: crashes can interrupt an attempted request, and remote processing may continue after local cancellation. Request usage records attempted initiation; unknown token counts remain null. Wall-clock adjustments affect absolute deadlines; the scheduler rechecks the clock at least once a second and at request/completion boundaries.
+
+### Validation and verdict against v0.1
+
+The local suite reports **32 passed, 0 failed, 1 ignored live test**: seven store tests and twenty-five daemon/CLI/HTTP tests. Formatting, locked all-target build, and Clippy pass. No paid request was made for this milestone; milestone 2's live DeepSeek result remains the provider evidence.
+
+| Hypothesis / baseline | Evidence |
+|---|---|
+| Independent sessions overlap instead of the previous serial worker | A local server accepts A and B requests while both response sockets remain gated; a third independent request stays queued at the two-slot limit. |
+| Configured capacity determines concurrency | The same fake-runner lifecycle with one slot keeps the independent second session queued until cancellation releases the first. This is a functional comparison, not a throughput benchmark. |
+| Same-session FIFO and history survive concurrency | A2 cannot start while A1 runs; cancellation drops A1's socket before A2 starts; A2 excludes the cancelled turn, and A3 receives only committed A2 history. |
+| Cancellation and completion have one durable winner | Store tests exercise both commit orders; cancelled runs reject late success/failure, preserve attempted request counts, and append no messages. |
+| Deadlines survive scheduling and restart | Tests cover queued and active expiry, HTTP future drop, checks at request/completion without a scheduler sweep, and restart with expired work and persisted stops. |
+| Ambiguous submit retry does not duplicate work | Eight concurrent identical submissions yield one run; the original receipt survives completion, full queue capacity, and daemon restart. Changed input/session/timeout conflict. |
+| Migration preserves durable data | Version-1 integration upgrade and version-2 store upgrade retain records and messages; foreign-key integrity and enforcement are checked. |
+
+**Verdict:** the CLI now behaves as intended for concurrent asynchronous execution: submit returns independently, sessions progress concurrently within limits, waits are bounded, and cancellation/deadlines/retries have durable semantics. It is still a text-generation executor, not the complete subagent swarm framework. Next is milestone 4: a persisted `ask_parent` question, `waiting_for_parent`, and `resume` with stale/duplicate answer handling. Milestone 5 adds paginated list/log inspection and retention decisions. Workspace tools and sandbox execution remain subsequent work.
