@@ -37,14 +37,29 @@ enum Command {
         config: Option<PathBuf>,
         #[arg(long, requires = "runner", value_parser = clap::value_parser!(u64).range(0..=30_000))]
         fake_delay_ms: Option<u64>,
+        /// Maximum concurrent runs across independent sessions.
+        #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u64).range(1..=64))]
+        max_active_runs: u64,
     },
     Ping,
     Submit {
         #[arg(long)]
         session: Option<String>,
+        /// Run lifetime including queue time, independent of wait timeout.
+        #[arg(long, default_value_t = protocol::default_run_timeout_ms(), value_parser = clap::value_parser!(u64).range(1..=86_400_000))]
+        run_timeout_ms: u64,
+        /// Reuse this key with identical input/options to retry submission safely.
+        #[arg(long)]
+        idempotency_key: Option<String>,
         /// UTF-8 prompt file, or - for stdin.
         #[arg(long)]
         input: PathBuf,
+        #[arg(long, value_enum, default_value = "json")]
+        output: JsonOutput,
+    },
+    Cancel {
+        #[arg(long)]
+        run: String,
         #[arg(long, value_enum, default_value = "json")]
         output: JsonOutput,
     },
@@ -91,6 +106,7 @@ pub async fn run(args: Cli) -> anyhow::Result<()> {
             runner: _,
             config,
             fake_delay_ms,
+            max_active_runs,
         } => {
             let profile = match config {
                 Some(path) => Profile::Chat(Box::new(config::load(&path)?)),
@@ -100,11 +116,18 @@ pub async fn run(args: Cli) -> anyhow::Result<()> {
                 args.data_dir,
                 profile,
                 Duration::from_millis(fake_delay_ms.unwrap_or(100)),
+                max_active_runs as usize,
             )
             .await;
         }
         Command::Ping => (Operation::Ping, false),
-        Command::Submit { session, input, .. } => {
+        Command::Submit {
+            session,
+            input,
+            run_timeout_ms,
+            idempotency_key,
+            ..
+        } => {
             // Read before any network request, with a bound even for stdin.
             let input = match read_input(input) {
                 Ok(input) => input,
@@ -124,10 +147,13 @@ pub async fn run(args: Cli) -> anyhow::Result<()> {
                 Operation::Submit {
                     session_id: session,
                     input,
+                    run_timeout_ms,
+                    idempotency_key,
                 },
                 false,
             )
         }
+        Command::Cancel { run, .. } => (Operation::Cancel { run_id: run }, false),
         Command::Status { run, .. } => (Operation::Status { run_id: run }, false),
         Command::Wait {
             run, timeout_ms, ..

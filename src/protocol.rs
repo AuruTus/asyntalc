@@ -5,6 +5,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub const VERSION: u32 = 1;
 pub const MAX_FRAME: usize = 1024 * 1024;
 pub const MAX_INPUT: usize = 64 * 1024;
+pub fn default_run_timeout_ms() -> u64 {
+    600_000
+}
+pub const MAX_RUN_TIMEOUT_MS: u64 = 86_400_000;
 pub const MAX_WAIT_MS: u64 = 30_000;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -22,6 +26,12 @@ pub enum Operation {
     Submit {
         session_id: Option<String>,
         input: String,
+        #[serde(default = "default_run_timeout_ms")]
+        run_timeout_ms: u64,
+        idempotency_key: Option<String>,
+    },
+    Cancel {
+        run_id: String,
     },
     Status {
         run_id: String,

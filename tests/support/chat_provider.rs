@@ -270,7 +270,7 @@ fn chat_uses_committed_history_and_survives_restart() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
     let profile: String = db
         .query_row(
@@ -476,7 +476,7 @@ fn embedded_migration_preserves_v1_results_and_sessions() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        2
+        3
     );
 }
 
@@ -650,4 +650,142 @@ fn deepseek_example_uses_root_endpoint_and_optional_reasoning_setting() {
     assert_eq!(request.body["max_tokens"], 1024);
     assert!(request.body.get("n").is_none());
     assert_eq!(wait(&daemon, &run)["status"], "completed");
+}
+
+// Keep response sockets in the test thread: each accepted request is an explicit barrier.
+fn gated_chat() -> (TcpListener, Daemon) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let dir = private_dir();
+    std::fs::write(
+        dir.path().join("provider.toml"),
+        config_text(&format!("http://{}/v1", listener.local_addr().unwrap()), ""),
+    )
+    .unwrap();
+    let child = spawn_chat(dir.path());
+    let mut daemon = Daemon { child, dir };
+    daemon.ready();
+    (listener, daemon)
+}
+fn accept_request(listener: &TcpListener) -> (TcpStream, Captured) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match listener.accept() {
+            Ok((mut socket, _)) => {
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let request = read_request(&mut socket);
+                return (socket, request);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "HTTP request did not start");
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    }
+}
+fn chat_submit(daemon: &Daemon, session: &str, input: &str) -> String {
+    let response = daemon.rpc(json!({"op":"submit","session_id":session,"input":input}));
+    assert_eq!(response["ok"], true);
+    response["run_id"].as_str().unwrap().into()
+}
+
+#[test]
+fn concurrent_http_requests_preserve_fifo_history_and_release_cancelled_session() {
+    let (listener, daemon) = gated_chat();
+    let a = chat_submit(&daemon, "a", "a1");
+    let (mut a_socket, _) = accept_request(&listener);
+    let a2 = chat_submit(&daemon, "a", "a2");
+    let b = chat_submit(&daemon, "b", "b1");
+    let (mut b_socket, b_request) = accept_request(&listener);
+    assert_eq!(
+        b_request.body["messages"],
+        json!([{"role":"user","content":"b1"}])
+    );
+    assert_eq!(
+        daemon.rpc(json!({"op":"status","run_id":a2}))["status"],
+        "queued"
+    );
+    let c = chat_submit(&daemon, "c", "c1");
+    assert_eq!(
+        daemon.rpc(json!({"op":"status","run_id":c}))["status"],
+        "queued"
+    );
+    send_body(
+        &mut b_socket,
+        200,
+        &serde_json::to_vec(&answer("b answer")).unwrap(),
+    );
+    assert_eq!(wait(&daemon, &b)["status"], "completed");
+    let (mut c_socket, c_request) = accept_request(&listener);
+    assert_eq!(c_request.body["messages"][0]["content"], "c1");
+    daemon.rpc(json!({"op":"cancel","run_id":a}));
+    let cancelled = wait(&daemon, &a);
+    assert_eq!(cancelled["status"], "cancelled");
+    assert_eq!(cancelled["usage"]["model_requests"], 1);
+    // The local request has been dropped before A2 may claim the session.
+    assert_eq!(a_socket.read(&mut [0_u8; 1]).unwrap(), 0);
+    let (mut a2_socket, a2_request) = accept_request(&listener);
+    assert_eq!(
+        a2_request.body["messages"],
+        json!([{"role":"user","content":"a2"}])
+    );
+    // Even a server trying to return the abandoned answer cannot change durable state.
+    send_body(
+        &mut a_socket,
+        200,
+        &serde_json::to_vec(&answer("late a answer")).unwrap(),
+    );
+    send_body(
+        &mut a2_socket,
+        200,
+        &serde_json::to_vec(&answer("a2 answer")).unwrap(),
+    );
+    send_body(
+        &mut c_socket,
+        200,
+        &serde_json::to_vec(&answer("c answer")).unwrap(),
+    );
+    assert_eq!(wait(&daemon, &a2)["status"], "completed");
+    assert_eq!(wait(&daemon, &c)["status"], "completed");
+    assert_eq!(wait(&daemon, &a)["revision"], cancelled["revision"]);
+    let a3 = chat_submit(&daemon, "a", "a3");
+    let (mut a3_socket, a3_request) = accept_request(&listener);
+    assert_eq!(
+        a3_request.body["messages"],
+        json!([{"role":"user","content":"a2"},{"role":"assistant","content":"a2 answer"},{"role":"user","content":"a3"}])
+    );
+    send_body(
+        &mut a3_socket,
+        200,
+        &serde_json::to_vec(&answer("a3 answer")).unwrap(),
+    );
+    assert_eq!(wait(&daemon, &a3)["status"], "completed");
+}
+
+#[test]
+fn run_deadline_drops_active_http_request_without_history() {
+    let (listener, daemon) = gated_chat();
+    let receipt =
+        daemon.rpc(json!({"op":"submit","session_id":"a","input":"expire","run_timeout_ms":500}));
+    let id = receipt["run_id"].as_str().unwrap();
+    let (mut socket, _) = accept_request(&listener);
+    let expired = wait(&daemon, id);
+    assert_eq!(expired["status"], "timed_out");
+    assert_eq!(expired["usage"]["model_requests"], 1);
+    assert_eq!(socket.read(&mut [0_u8; 1]).unwrap(), 0);
+    let next = chat_submit(&daemon, "a", "next");
+    let (mut socket, request) = accept_request(&listener);
+    assert_eq!(
+        request.body["messages"],
+        json!([{"role":"user","content":"next"}])
+    );
+    send_body(
+        &mut socket,
+        200,
+        &serde_json::to_vec(&answer("healthy")).unwrap(),
+    );
+    assert_eq!(wait(&daemon, &next)["status"], "completed");
 }

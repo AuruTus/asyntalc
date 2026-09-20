@@ -19,7 +19,8 @@ use tokio::{
 use crate::{
     config::Profile,
     protocol::{self, Operation, Request, Response},
-    provider::{ChatProvider, Completion, Failure, Usage},
+    provider::ChatProvider,
+    scheduler::{self, Executor},
     store::{Store, StoreError},
 };
 
@@ -33,7 +34,12 @@ impl Drop for Ownership {
     }
 }
 
-pub async fn run(data_dir: PathBuf, profile: Profile, fake_delay: Duration) -> anyhow::Result<()> {
+pub async fn run(
+    data_dir: PathBuf,
+    profile: Profile,
+    fake_delay: Duration,
+    max_active_runs: usize,
+) -> anyhow::Result<()> {
     let runner_name = profile.name();
     let provider = match &profile {
         Profile::Fake => None,
@@ -74,14 +80,20 @@ pub async fn run(data_dir: PathBuf, profile: Profile, fake_delay: Duration) -> a
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let pending = Arc::new(Notify::new());
     let (changes, _) = watch::channel(0_u64);
-    let mut worker = tokio::spawn(run_worker(
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let mut worker = tokio::spawn(scheduler::run(
         store.clone(),
         pending.clone(),
         changes.clone(),
-        fake_delay,
-        profile,
-        provider,
+        Executor {
+            delay: fake_delay,
+            profile,
+            provider,
+        },
+        max_active_runs,
+        shutdown_rx,
     ));
+    let mut worker_joined = false;
     let slots = Arc::new(Semaphore::new(64));
     let mut clients = JoinSet::new();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -107,6 +119,7 @@ pub async fn run(data_dir: PathBuf, profile: Profile, fake_delay: Duration) -> a
                 if let Err(error) = result { eprintln!("client task: {error}"); }
             }
             result = &mut worker => {
+                worker_joined = true;
                 break match result {
                     Ok(Err(error)) => Err(error),
                     Ok(Ok(())) => Err(anyhow::anyhow!("worker stopped unexpectedly")),
@@ -119,73 +132,14 @@ pub async fn run(data_dir: PathBuf, profile: Profile, fake_delay: Duration) -> a
     };
     clients.abort_all();
     while clients.join_next().await.is_some() {}
-    worker.abort();
-    if !worker.is_finished() {
-        let _ = worker.await;
+    shutdown.send_replace(true);
+    if !worker_joined {
+        worker.await.context("scheduler task failed")??;
     }
     // All accepted DB jobs finish before the store barrier returns. Keep the lock until then.
     // Store clones held by aborted tasks have now been dropped.
     store.barrier().await?;
     outcome
-}
-
-async fn run_worker(
-    store: Store,
-    pending: Arc<Notify>,
-    changes: watch::Sender<u64>,
-    delay: Duration,
-    profile: Profile,
-    provider: Option<ChatProvider>,
-) -> anyhow::Result<()> {
-    loop {
-        // Notify retains a permit if submission commits between claim and notified().
-        if let Some(work) = store.claim().await? {
-            changes.send_modify(|revision| *revision = revision.wrapping_add(1));
-            let outcome = match &profile {
-                Profile::Fake => {
-                    tokio::time::sleep(delay).await;
-                    Ok(Completion {
-                        text: format!("[fake] {}", work.input),
-                        finish_reason: "stop".into(),
-                        usage: Usage::default(),
-                    })
-                }
-                Profile::Chat(config) => {
-                    match store
-                        .context(&work, config.max_context_bytes - config.system_prompt.len())
-                        .await
-                    {
-                        Ok(messages) => {
-                            store.mark_requested(work.run_id.clone()).await?;
-                            provider
-                                .as_ref()
-                                .expect("chat profile has a provider")
-                                .complete(messages)
-                                .await
-                        }
-                        Err(error)
-                            if error
-                                .downcast_ref::<StoreError>()
-                                .is_some_and(|e| e.0 == "context_limit") =>
-                        {
-                            Err(Failure::new(
-                                "context_limit",
-                                "Conversation exceeds the configured context byte limit; start a new session",
-                            ))
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            };
-            match outcome {
-                Ok(completion) => store.complete(work, completion).await?,
-                Err(failure) => store.fail(work.run_id, failure).await?,
-            }
-            changes.send_modify(|revision| *revision = revision.wrapping_add(1));
-        } else {
-            pending.notified().await;
-        }
-    }
 }
 
 async fn serve(
@@ -279,7 +233,12 @@ async fn dispatch(
 ) -> anyhow::Result<serde_json::Value> {
     match &request.operation {
         Operation::Ping => Ok(json!({"ready": true, "runner": runner_name})),
-        Operation::Submit { session_id, input } => {
+        Operation::Submit {
+            session_id,
+            input,
+            run_timeout_ms,
+            idempotency_key,
+        } => {
             if input.trim().is_empty() || input.len() > protocol::MAX_INPUT {
                 return Err(StoreError("invalid_input").into());
             }
@@ -292,10 +251,36 @@ async fn dispatch(
             }) {
                 return Err(StoreError("invalid_session_id").into());
             }
-            let receipt = store.submit(session_id.clone(), input.clone()).await?;
+            if *run_timeout_ms == 0 || *run_timeout_ms > protocol::MAX_RUN_TIMEOUT_MS {
+                return Err(StoreError("invalid_run_timeout").into());
+            }
+            if idempotency_key.as_ref().is_some_and(|key| {
+                key.is_empty()
+                    || key.len() > 128
+                    || !key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+            }) {
+                return Err(StoreError("invalid_idempotency_key").into());
+            }
+            let receipt = store
+                .submit(
+                    session_id.clone(),
+                    input.clone(),
+                    *run_timeout_ms,
+                    idempotency_key.clone(),
+                )
+                .await?;
             // Notification happens even if the client disconnected after submission.
             pending.notify_one();
             Ok(receipt)
+        }
+        Operation::Cancel { run_id } => {
+            store.cancel(run_id.clone()).await?;
+            pending.notify_one();
+            let mut snapshot = serde_json::to_value(store.snapshot(run_id.clone(), false).await?)?;
+            snapshot["return_reason"] = json!("snapshot");
+            Ok(snapshot)
         }
         Operation::Status { run_id } => {
             let mut snapshot = serde_json::to_value(store.snapshot(run_id.clone(), false).await?)?;
@@ -310,7 +295,10 @@ async fn dispatch(
             let deadline = Instant::now() + Duration::from_millis(*timeout_ms);
             loop {
                 let snapshot = store.snapshot(run_id.clone(), true).await?;
-                let terminal = matches!(snapshot.status.as_str(), "completed" | "failed");
+                let terminal = matches!(
+                    snapshot.status.as_str(),
+                    "completed" | "failed" | "cancelled" | "timed_out"
+                );
                 let mut value = serde_json::to_value(snapshot)?;
                 if terminal || Instant::now() >= deadline {
                     value["return_reason"] =

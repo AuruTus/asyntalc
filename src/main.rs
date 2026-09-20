@@ -3,6 +3,7 @@ mod config;
 mod daemon;
 mod protocol;
 mod provider;
+mod scheduler;
 mod store;
 
 use clap::Parser;
