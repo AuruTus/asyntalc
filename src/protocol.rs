@@ -30,6 +30,11 @@ pub enum Operation {
         run_timeout_ms: u64,
         idempotency_key: Option<String>,
     },
+    Resume {
+        run_id: String,
+        question_id: String,
+        input: String,
+    },
     Cancel {
         run_id: String,
     },

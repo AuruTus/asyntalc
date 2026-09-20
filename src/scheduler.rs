@@ -1,6 +1,6 @@
 use crate::{
     config::Profile,
-    provider::{ChatProvider, Completion, Failure, Usage},
+    provider::{ChatProvider, Completion, Failure, Turn, Usage},
     store::{Store, StoreError, Work, now_ms},
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -16,19 +16,15 @@ pub struct Executor {
 }
 
 impl Executor {
-    async fn execute(
-        &self,
-        store: &Store,
-        work: &Work,
-    ) -> anyhow::Result<Result<Completion, Failure>> {
+    async fn execute(&self, store: &Store, work: &Work) -> anyhow::Result<Result<Turn, Failure>> {
         let outcome = match &self.profile {
             Profile::Fake => {
                 tokio::time::sleep(self.delay).await;
-                Ok(Completion {
+                Ok(Turn::Complete(Completion {
                     text: format!("[fake] {}", work.input),
                     finish_reason: "stop".into(),
                     usage: Usage::default(),
-                })
+                }))
             }
             Profile::Chat(config) => {
                 match store
@@ -36,8 +32,25 @@ impl Executor {
                     .await
                 {
                     Ok(messages) => {
-                        if !store.mark_requested(work.run_id.clone()).await? {
-                            return Ok(Err(Failure::new("stopped", "Run stopped before request")));
+                        match store.mark_requested(work.run_id.clone()).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                return Ok(Err(Failure::new(
+                                    "stopped",
+                                    "Run stopped before request",
+                                )));
+                            }
+                            Err(error)
+                                if error
+                                    .downcast_ref::<StoreError>()
+                                    .is_some_and(|e| e.0 == "model_turn_limit") =>
+                            {
+                                return Ok(Err(Failure::new(
+                                    "model_turn_limit",
+                                    "Run exceeds nine model requests",
+                                )));
+                            }
+                            Err(error) => return Err(error),
                         }
                         self.provider
                             .as_ref()
@@ -82,7 +95,7 @@ pub async fn run(
                 if let Some(stop) = active.get(&id) { stop.send_replace(true); }
             }
             while jobs.len() < max_active {
-                let Some(work) = store.claim().await? else { break; };
+                let Some(work) = store.claim_available(active.keys().cloned().collect()).await? else { break; };
                 let (stop, mut stop_rx) = watch::channel(false);
                 active.insert(work.run_id.clone(), stop);
                 let store = store.clone();
@@ -98,7 +111,8 @@ pub async fn run(
                     };
                     let id = work.run_id.clone();
                     match result {
-                        Ok(completion) => store.complete(work, completion).await?,
+                        Ok(Turn::Complete(completion)) => store.complete(work, completion).await?,
+                        Ok(Turn::Question(question)) => store.pause(work, question).await?,
                         Err(failure) => store.fail(work.run_id, failure).await?,
                     }
                     changes.send_modify(|r| *r = r.wrapping_add(1));

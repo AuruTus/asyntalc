@@ -275,6 +275,23 @@ async fn dispatch(
             pending.notify_one();
             Ok(receipt)
         }
+        Operation::Resume {
+            run_id,
+            question_id,
+            input,
+        } => {
+            if input.trim().is_empty() || input.len() > protocol::MAX_INPUT {
+                return Err(StoreError("invalid_input").into());
+            }
+            if question_id.is_empty() || question_id.len() > 128 {
+                return Err(StoreError("invalid_question_id").into());
+            }
+            let result = store
+                .resume(run_id.clone(), question_id.clone(), input.clone())
+                .await;
+            pending.notify_one();
+            result
+        }
         Operation::Cancel { run_id } => {
             store.cancel(run_id.clone()).await?;
             pending.notify_one();
@@ -299,10 +316,16 @@ async fn dispatch(
                     snapshot.status.as_str(),
                     "completed" | "failed" | "cancelled" | "timed_out"
                 );
+                let input_required = snapshot.status == "waiting_for_parent";
                 let mut value = serde_json::to_value(snapshot)?;
-                if terminal || Instant::now() >= deadline {
-                    value["return_reason"] =
-                        json!(if terminal { "terminal" } else { "wait_timeout" });
+                if terminal || input_required || Instant::now() >= deadline {
+                    value["return_reason"] = json!(if terminal {
+                        "terminal"
+                    } else if input_required {
+                        "input_required"
+                    } else {
+                        "wait_timeout"
+                    });
                     return Ok(value);
                 }
                 // The receiver was subscribed before reading state. Read again even on timeout.

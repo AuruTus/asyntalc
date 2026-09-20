@@ -57,6 +57,18 @@ enum Command {
         #[arg(long, value_enum, default_value = "json")]
         output: JsonOutput,
     },
+    /// Answer a persisted parent question and requeue the same run.
+    Resume {
+        #[arg(long)]
+        run: String,
+        #[arg(long)]
+        question: String,
+        /// UTF-8 answer file, or - for stdin.
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, value_enum, default_value = "json")]
+        output: JsonOutput,
+    },
     Cancel {
         #[arg(long)]
         run: String,
@@ -149,6 +161,35 @@ pub async fn run(args: Cli) -> anyhow::Result<()> {
                     input,
                     run_timeout_ms,
                     idempotency_key,
+                },
+                false,
+            )
+        }
+        Command::Resume {
+            run,
+            question,
+            input,
+            ..
+        } => {
+            let input = match read_input(input) {
+                Ok(input) => input,
+                Err(error) => {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&Response::error(
+                            None,
+                            "invalid_input",
+                            &error.to_string()
+                        ))?
+                    );
+                    return Err(error);
+                }
+            };
+            (
+                Operation::Resume {
+                    run_id: run,
+                    question_id: question,
+                    input,
                 },
                 false,
             )

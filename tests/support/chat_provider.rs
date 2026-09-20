@@ -167,11 +167,17 @@ fn config_text(base_url: &str, extra: &str) -> String {
 }
 
 fn spawn_chat(dir: &Path) -> Child {
+    spawn_chat_with_limit(dir, 2)
+}
+
+fn spawn_chat_with_limit(dir: &Path, slots: u64) -> Child {
     Command::new(BIN)
         .arg("--data-dir")
         .arg(dir)
         .args(["daemon", "--config"])
         .arg(dir.join("provider.toml"))
+        .arg("--max-active-runs")
+        .arg(slots.to_string())
         .env("ASYNTALC_TEST_KEY", TEST_KEY)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost")
@@ -270,7 +276,7 @@ fn chat_uses_committed_history_and_survives_restart() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     let profile: String = db
         .query_row(
@@ -476,7 +482,7 @@ fn embedded_migration_preserves_v1_results_and_sessions() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
 }
 
@@ -789,3 +795,6 @@ fn run_deadline_drops_active_http_request_without_history() {
     );
     assert_eq!(wait(&daemon, &next)["status"], "completed");
 }
+
+#[path = "parent_questions.rs"]
+mod parent_questions;

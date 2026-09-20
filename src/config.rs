@@ -22,6 +22,9 @@ impl Profile {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ChatConfig {
+    /// Enable the single ask_parent control tool; disabled profiles serialize as before.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ask_parent: bool,
     pub base_url: String,
     pub model: String,
     pub api_key_env: String,
@@ -43,6 +46,10 @@ pub struct ChatConfig {
     pub max_response_bytes: usize,
     #[serde(default = "default_output")]
     pub max_output_bytes: usize,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 fn default_timeout() -> u64 {

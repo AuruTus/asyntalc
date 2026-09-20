@@ -13,6 +13,33 @@ use crate::config::ChatConfig;
 pub struct Message {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+impl Message {
+    pub fn text(role: &str, content: String) -> Self {
+        Self {
+            role: role.into(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+}
+
+pub enum Turn {
+    Complete(Completion),
+    Question(Question),
+}
+
+pub struct Question {
+    pub call_id: String,
+    pub prompt: String,
+    pub choices: Option<Vec<String>>,
+    pub assistant: Message,
+    pub usage: Usage,
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -76,17 +103,24 @@ impl ChatProvider {
         })
     }
 
-    pub async fn complete(&self, mut messages: Vec<Message>) -> Result<Completion, Failure> {
+    pub async fn complete(&self, mut messages: Vec<Message>) -> Result<Turn, Failure> {
         if !self.config.system_prompt.is_empty() {
             messages.insert(
                 0,
-                Message {
-                    role: self.config.instruction_role.clone(),
-                    content: self.config.system_prompt.clone(),
-                },
+                Message::text(
+                    &self.config.instruction_role,
+                    self.config.system_prompt.clone(),
+                ),
             );
         }
         let mut body = json!({"model": self.config.model, "messages": messages, "stream": false});
+        if self.config.ask_parent {
+            body["tools"] = json!([{"type":"function","function":{
+                "name":"ask_parent","description":"Ask the parent for clarification and pause until it answers.",
+                "parameters":{"type":"object","properties":{"prompt":{"type":"string"},"choices":{"type":"array","items":{"type":"string"}}},"required":["prompt"],"additionalProperties":false}
+            }}]);
+            body["parallel_tool_calls"] = json!(false);
+        }
         body[&self.config.output_token_parameter] = json!(self.config.max_output_tokens);
         if let Some(effort) = &self.config.reasoning_effort {
             body["reasoning_effort"] = json!(effort);
@@ -99,7 +133,7 @@ impl ChatProvider {
         })
     }
 
-    async fn request(&self, body: Value) -> Result<Completion, Failure> {
+    async fn request(&self, body: Value) -> Result<Turn, Failure> {
         let mut response = self
             .client
             .post(format!("{}/chat/completions", self.config.base_url))
@@ -154,7 +188,7 @@ impl ChatProvider {
             }
             bytes.extend_from_slice(&chunk);
         }
-        parse_completion(&bytes, self.config.max_output_bytes)
+        parse_completion(&bytes, self.config.max_output_bytes, self.config.ask_parent)
     }
 }
 
@@ -200,7 +234,7 @@ struct AssistantMessage {
     function_call: Option<Value>,
 }
 
-fn parse_completion(bytes: &[u8], output_limit: usize) -> Result<Completion, Failure> {
+fn parse_completion(bytes: &[u8], output_limit: usize, ask_parent: bool) -> Result<Turn, Failure> {
     let protocol_error = || {
         Failure::new(
             "provider_protocol_error",
@@ -239,6 +273,19 @@ fn parse_completion(bytes: &[u8], output_limit: usize) -> Result<Completion, Fai
     // Bound provider-controlled metadata as well as text.
     if choice.finish_reason.len() > 64 {
         return Err(protocol_error());
+    }
+    if ask_parent
+        && choice.finish_reason == "tool_calls"
+        && choice.message.refusal.as_deref().is_none_or(str::is_empty)
+        && choice.message.function_call.is_none()
+    {
+        return parse_question(choice.message, usage.clone(), output_limit)
+            .map(Turn::Question)
+            .map_err(|mut error| {
+                error.usage = usage;
+                error.finish_reason = Some("tool_calls".into());
+                error
+            });
     }
     let text = choice.message.content.unwrap_or_default();
     let error = if choice
@@ -294,9 +341,82 @@ fn parse_completion(bytes: &[u8], output_limit: usize) -> Result<Completion, Fai
         }
         return Err(failure);
     }
-    Ok(Completion {
+    Ok(Turn::Complete(Completion {
         text,
         finish_reason: choice.finish_reason,
         usage,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionArgs {
+    prompt: String,
+    choices: Option<Vec<String>>,
+}
+
+fn parse_question(
+    message: AssistantMessage,
+    usage: Usage,
+    output_limit: usize,
+) -> Result<Question, Failure> {
+    let invalid = || {
+        Failure::new(
+            "invalid_parent_question",
+            "Provider returned an invalid ask_parent call",
+        )
+    };
+    let calls = message.tool_calls.ok_or_else(invalid)?;
+    if calls.len() != 1 {
+        return Err(invalid());
+    }
+    let call = &calls[0];
+    let id = call["id"].as_str().ok_or_else(invalid)?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    {
+        return Err(invalid());
+    }
+    if call["type"] != "function" || call["function"]["name"] != "ask_parent" {
+        return Err(invalid());
+    }
+    let arguments = call["function"]["arguments"].as_str().ok_or_else(invalid)?;
+    if arguments.len() > 16 * 1024 {
+        return Err(invalid());
+    }
+    let args: QuestionArgs = serde_json::from_str(arguments).map_err(|_| invalid())?;
+    if args.prompt.trim().is_empty()
+        || args.prompt.len() > 8 * 1024
+        || args.choices.as_ref().is_some_and(|v| {
+            v.is_empty() || v.len() > 8 || v.iter().any(|s| s.trim().is_empty() || s.len() > 256)
+        })
+    {
+        return Err(invalid());
+    }
+    let content = message.content.unwrap_or_default();
+    if content.len() > output_limit {
+        return Err(Failure::new(
+            "output_limit",
+            "Provider question exceeds output limit",
+        ));
+    }
+    let call_id = id.to_owned();
+    // Persist only validated fields, not arbitrary provider metadata.
+    let tool_calls =
+        json!({"id":id,"type":"function","function":{"name":"ask_parent","arguments":arguments}});
+    Ok(Question {
+        call_id,
+        prompt: args.prompt,
+        choices: args.choices,
+        usage,
+        assistant: Message {
+            role: "assistant".into(),
+            content,
+            tool_calls: Some(vec![tool_calls]),
+            tool_call_id: None,
+        },
     })
 }
