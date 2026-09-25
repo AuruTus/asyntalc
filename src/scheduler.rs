@@ -13,6 +13,7 @@ pub struct Executor {
     pub delay: Duration,
     pub profile: Profile,
     pub provider: Option<ChatProvider>,
+    pub workspace: Option<Arc<crate::workspace::Workspace>>,
 }
 
 impl Executor {
@@ -47,7 +48,7 @@ impl Executor {
                             {
                                 return Ok(Err(Failure::new(
                                     "model_turn_limit",
-                                    "Run exceeds nine model requests",
+                                    "Run exceeds its model request limit",
                                 )));
                             }
                             Err(error) => return Err(error),
@@ -103,6 +104,7 @@ pub async fn run(
                 let changes = changes.clone();
                 changes.send_modify(|r| *r = r.wrapping_add(1));
                 jobs.spawn(async move {
+                  loop {
                     // Dropping the provider future closes the local request before releasing the session.
                     let result = tokio::select! {
                         biased;
@@ -113,10 +115,29 @@ pub async fn run(
                     match result {
                         Ok(Turn::Complete(completion)) => store.complete(work, completion).await?,
                         Ok(Turn::Question(question)) => store.pause(work, question).await?,
+                        Ok(Turn::Tool(call)) => {
+                            match store.tool_allowed(work.run_id.clone(), call.call_id.clone()).await {
+                                Ok(true) => {
+                                    let result = executor.workspace.as_ref().expect("workspace call requires configured workspace").execute(&call.name, &call.arguments);
+                                    if store.record_tool(&work, call, result).await? {
+                                        changes.send_modify(|r| *r = r.wrapping_add(1));
+                                        continue;
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    let Some(store_error) = error.downcast_ref::<StoreError>() else { return Err(error); };
+                                    let mut failure = Failure::new(store_error.0, "Workspace tool call limit reached or duplicate call ID");
+                                    failure.usage = call.usage;
+                                    store.fail(work.run_id, failure).await?;
+                                }
+                            }
+                        }
                         Err(failure) => store.fail(work.run_id, failure).await?,
                     }
                     changes.send_modify(|r| *r = r.wrapping_add(1));
-                    Ok::<_,anyhow::Error>(id)
+                    return Ok::<_,anyhow::Error>(id);
+                  }
                 });
             }
             // Recheck the wall clock at least once a second, including after clock adjustments.

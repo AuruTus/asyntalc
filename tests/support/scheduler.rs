@@ -19,21 +19,27 @@ fn cancel(daemon: &Daemon, id: &str) {
 }
 
 #[test]
-fn concurrent_sessions_respect_fifo_and_global_limit_and_cancel_frees_slot() {
+fn concurrent_sessions_reject_busy_session_and_cancel_frees_slot() {
     let daemon = Daemon::start(30_000);
     let a = submit(&daemon, "a", 600_000);
     daemon.wait_running(&a);
-    let a2 = submit(&daemon, "a", 600_000);
+    assert_eq!(
+        daemon.rpc(json!({"op":"submit","session_id":"a","input":"second"}))["error"]["code"],
+        "session_busy"
+    );
     let b = submit(&daemon, "b", 600_000);
     daemon.wait_running(&b);
     let c = submit(&daemon, "c", 600_000);
-    assert_eq!(status(&daemon, &a2)["status"], "queued");
-    assert_eq!(status(&daemon, &a2)["blocked_by_run_id"], a);
     assert_eq!(status(&daemon, &c)["status"], "queued");
     assert!(status(&daemon, &c)["blocked_by_run_id"].is_null());
-    cancel(&daemon, &a2);
     cancel(&daemon, &a);
     daemon.wait_running(&c);
+    let next = submit(&daemon, "a", 600_000);
+    assert_eq!(status(&daemon, &next)["status"], "queued");
+    assert_eq!(
+        daemon.rpc(json!({"op":"submit","session_id":"a","input":"third"}))["error"]["code"],
+        "session_busy"
+    );
     assert_eq!(status(&daemon, &b)["status"], "running");
     let terminal = status(&daemon, &a);
     cancel(&daemon, &a);
@@ -78,9 +84,9 @@ fn queued_and_active_deadlines_are_distinct_from_wait_timeouts() {
     let daemon = Daemon::start(30_000);
     let blocker = submit(&daemon, "a", 600_000);
     daemon.wait_running(&blocker);
-    let queued = submit(&daemon, "a", 150);
     let active = submit(&daemon, "b", 300);
     daemon.wait_running(&active);
+    let queued = submit(&daemon, "c", 150);
     let snapshot = daemon.rpc(json!({"op":"wait","run_id":active,"timeout_ms":0}));
     assert_eq!(snapshot["return_reason"], "wait_timeout");
     let queued = wait(&daemon, &queued);
@@ -90,6 +96,39 @@ fn queued_and_active_deadlines_are_distinct_from_wait_timeouts() {
     assert_eq!(active["status"], "timed_out");
     assert!(!active["started_at_ms"].is_null());
     assert_eq!(status(&daemon, &blocker)["status"], "running");
+}
+
+#[test]
+fn simultaneous_parents_accept_exactly_one_turn() {
+    let daemon = Daemon::start(30_000);
+    let replies = thread::scope(|scope| {
+        (0..8)
+            .map(|i| {
+                let daemon = &daemon;
+                scope.spawn(move || {
+                    daemon.rpc(
+                        json!({"op":"submit","session_id":"shared","input":format!("parent {i}")}),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        replies.iter().filter(|reply| reply["ok"] == true).count(),
+        1
+    );
+    assert_eq!(
+        replies
+            .iter()
+            .filter(|reply| reply["error"]["code"] == "session_busy")
+            .count(),
+        7
+    );
+    let runs = daemon.rpc(json!({"op":"list","session_id":"shared"}));
+    assert_eq!(runs["runs"].as_array().unwrap().len(), 1);
 }
 
 #[test]

@@ -5,6 +5,7 @@ mod protocol;
 mod provider;
 mod scheduler;
 mod store;
+mod workspace;
 
 use clap::Parser;
 

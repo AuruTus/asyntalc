@@ -36,6 +36,7 @@ pub struct Request {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Ping,
+    Scope,
     List {
         session_id: Option<String>,
         status: Option<String>,

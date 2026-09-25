@@ -22,6 +22,8 @@ impl Profile {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ChatConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<crate::workspace::WorkspaceConfig>,
     /// Enable the single ask_parent control tool; disabled profiles serialize as before.
     #[serde(default, skip_serializing_if = "is_false")]
     pub ask_parent: bool,
@@ -78,6 +80,7 @@ fn default_output() -> usize {
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     provider: ChatConfig,
+    workspace: Option<crate::workspace::WorkspaceConfig>,
 }
 
 pub fn load(path: &Path) -> anyhow::Result<ChatConfig> {
@@ -89,10 +92,63 @@ pub fn load(path: &Path) -> anyhow::Result<ChatConfig> {
         .context("cannot read provider configuration as UTF-8")?;
     ensure!(text.len() <= 64 * 1024, "configuration exceeds 64 KiB");
     // TOML diagnostics can contain source lines; do not echo potentially secret values.
-    let parsed: ConfigFile = toml::from_str(&text).map_err(|_| {
+    let mut parsed: ConfigFile = toml::from_str(&text).map_err(|_| {
         anyhow::anyhow!("invalid provider configuration; check TOML fields and types")
     })?;
+    ensure!(
+        parsed.provider.workspace.is_none(),
+        "use the top-level [workspace] table"
+    );
+    if let Some(workspace) = &mut parsed.workspace {
+        workspace.validate()?;
+        exclude_private_path(workspace, &std::fs::canonicalize(path)?)?;
+    }
+    parsed.provider.workspace = parsed.workspace;
     parsed.provider.validate()
+}
+
+pub fn exclude_private_path(
+    workspace: &mut crate::workspace::WorkspaceConfig,
+    path: &Path,
+) -> anyhow::Result<()> {
+    workspace
+        .exclude
+        .extend([".git".into(), ".env".into(), ".asyntalc".into()]);
+    let root = std::fs::canonicalize(&workspace.root)?;
+    if let Ok(relative) = path.strip_prefix(root) {
+        ensure!(
+            !relative.as_os_str().is_empty(),
+            "workspace root cannot be the private data directory"
+        );
+        workspace.exclude.push(
+            relative
+                .to_str()
+                .context("private path must be UTF-8")?
+                .to_owned(),
+        );
+    }
+    workspace.exclude.sort();
+    workspace.exclude.dedup();
+    Ok(())
+}
+
+impl Profile {
+    pub fn scope(&self) -> serde_json::Value {
+        match self {
+            Self::Fake => serde_json::json!({"runner":"fake", "workspace":null}),
+            Self::Chat(config) => serde_json::json!({
+                "runner":"chat", "provider":{"base_url":config.base_url,"model":config.model},
+                "ask_parent":config.ask_parent,"workspace":config.workspace,
+                "filesystem_semantics":"live_files", "writes":false,"shell":false,
+                "workspace_limits":config.workspace.as_ref().map(|_| serde_json::json!({
+                    "max_depth":32,"max_scan_bytes":4194304,"max_result_bytes":262144,
+                    "max_matching_lines_per_file":100,"max_calls_per_run":16
+                })),
+                "max_model_requests":if config.workspace.is_some() {25} else {9},
+                "max_parent_questions":if config.ask_parent {8} else {0}
+            }),
+        }
+    }
 }
 
 impl ChatConfig {

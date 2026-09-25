@@ -17,3 +17,13 @@ request_timeout_ms = 120000                  # total HTTP request + response bod
 max_context_bytes = 262144                   # message content, including instructions
 max_response_bytes = 1048576                 # complete HTTP response body
 max_output_bytes = 65536                     # decoded final answer, at most 65536
+
+# Optional read-only workspace. Use an absolute directory with no symlinks.
+# Inspect the effective policy with `asyntalc scope` after starting the daemon.
+# [workspace]
+# root = "/absolute/path/to/project"
+# operations = ["read_file", "list_files", "search"]
+# exclude = [".git", ".env", ".asyntalc", "secrets", "target"]
+# max_file_bytes = 65536
+# max_entries = 1000
+# max_results = 100

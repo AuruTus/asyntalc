@@ -32,6 +32,15 @@ impl Message {
 pub enum Turn {
     Complete(Completion),
     Question(Question),
+    Tool(WorkspaceCall),
+}
+
+pub struct WorkspaceCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+    pub assistant: Message,
+    pub usage: Usage,
 }
 
 pub struct Question {
@@ -114,11 +123,19 @@ impl ChatProvider {
             );
         }
         let mut body = json!({"model": self.config.model, "messages": messages, "stream": false});
+        let mut tools = self
+            .config
+            .workspace
+            .as_ref()
+            .map_or_else(Vec::new, |w| w.tool_definitions());
         if self.config.ask_parent {
-            body["tools"] = json!([{"type":"function","function":{
+            tools.push(json!({"type":"function","function":{
                 "name":"ask_parent","description":"Ask the parent for clarification and pause until it answers.",
                 "parameters":{"type":"object","properties":{"prompt":{"type":"string"},"choices":{"type":"array","items":{"type":"string"}}},"required":["prompt"],"additionalProperties":false}
-            }}]);
+            }}));
+        }
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
             body["parallel_tool_calls"] = json!(false);
         }
         body[&self.config.output_token_parameter] = json!(self.config.max_output_tokens);
@@ -188,7 +205,12 @@ impl ChatProvider {
             }
             bytes.extend_from_slice(&chunk);
         }
-        parse_completion(&bytes, self.config.max_output_bytes, self.config.ask_parent)
+        parse_completion(
+            &bytes,
+            self.config.max_output_bytes,
+            self.config.ask_parent,
+            self.config.workspace.as_ref(),
+        )
     }
 }
 
@@ -234,7 +256,12 @@ struct AssistantMessage {
     function_call: Option<Value>,
 }
 
-fn parse_completion(bytes: &[u8], output_limit: usize, ask_parent: bool) -> Result<Turn, Failure> {
+fn parse_completion(
+    bytes: &[u8],
+    output_limit: usize,
+    ask_parent: bool,
+    workspace: Option<&crate::workspace::WorkspaceConfig>,
+) -> Result<Turn, Failure> {
     let protocol_error = || {
         Failure::new(
             "provider_protocol_error",
@@ -274,18 +301,26 @@ fn parse_completion(bytes: &[u8], output_limit: usize, ask_parent: bool) -> Resu
     if choice.finish_reason.len() > 64 {
         return Err(protocol_error());
     }
-    if ask_parent
+    if (ask_parent || workspace.is_some())
         && choice.finish_reason == "tool_calls"
         && choice.message.refusal.as_deref().is_none_or(str::is_empty)
         && choice.message.function_call.is_none()
     {
-        return parse_question(choice.message, usage.clone(), output_limit)
-            .map(Turn::Question)
-            .map_err(|mut error| {
-                error.usage = usage;
-                error.finish_reason = Some("tool_calls".into());
-                error
+        let is_question =
+            choice.message.tool_calls.as_ref().is_some_and(|calls| {
+                calls.len() == 1 && calls[0]["function"]["name"] == "ask_parent"
             });
+        return if ask_parent && (is_question || workspace.is_none()) {
+            parse_question(choice.message, usage.clone(), output_limit).map(Turn::Question)
+        } else {
+            parse_workspace_call(choice.message, usage.clone(), output_limit, workspace)
+                .map(Turn::Tool)
+        }
+        .map_err(|mut error| {
+            error.usage = usage;
+            error.finish_reason = Some("tool_calls".into());
+            error
+        });
     }
     let text = choice.message.content.unwrap_or_default();
     let error = if choice
@@ -311,7 +346,7 @@ fn parse_completion(bytes: &[u8], output_limit: usize, ask_parent: bool) -> Resu
     {
         Some(Failure::new(
             "unsupported_capability",
-            "Tool calls are not supported in this milestone",
+            "Provider requested a capability that is not enabled",
         ))
     } else if text.len() > output_limit || choice.finish_reason == "length" {
         Some(Failure::new(
@@ -353,6 +388,65 @@ fn parse_completion(bytes: &[u8], output_limit: usize, ask_parent: bool) -> Resu
 struct QuestionArgs {
     prompt: String,
     choices: Option<Vec<String>>,
+}
+
+fn parse_workspace_call(
+    message: AssistantMessage,
+    usage: Usage,
+    output_limit: usize,
+    workspace: Option<&crate::workspace::WorkspaceConfig>,
+) -> Result<WorkspaceCall, Failure> {
+    let invalid = || {
+        Failure::new(
+            "invalid_tool_call",
+            "Provider returned an invalid workspace tool call",
+        )
+    };
+    let calls = message.tool_calls.ok_or_else(invalid)?;
+    if calls.len() != 1 {
+        return Err(invalid());
+    }
+    let call = &calls[0];
+    let id = call["id"].as_str().ok_or_else(invalid)?;
+    let name = call["function"]["name"].as_str().ok_or_else(invalid)?;
+    let arguments = call["function"]["arguments"].as_str().ok_or_else(invalid)?;
+    if call["type"] != "function"
+        || id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        || arguments.len() > 16 * 1024
+    {
+        return Err(invalid());
+    }
+    if !workspace.is_some_and(|w| w.permits(name)) {
+        return Err(Failure::new(
+            "unsupported_capability",
+            "Provider requested a capability that is not enabled",
+        ));
+    }
+    let content = message.content.unwrap_or_default();
+    if content.len() > output_limit {
+        return Err(Failure::new(
+            "output_limit",
+            "Provider tool call exceeds output limit",
+        ));
+    }
+    Ok(WorkspaceCall {
+        call_id: id.into(),
+        name: name.into(),
+        arguments: arguments.into(),
+        usage,
+        assistant: Message {
+            role: "assistant".into(),
+            content,
+            tool_call_id: None,
+            tool_calls: Some(vec![
+                json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments}}),
+            ]),
+        },
+    })
 }
 
 fn parse_question(
@@ -419,4 +513,86 @@ fn parse_question(
             tool_call_id: None,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace() -> crate::workspace::WorkspaceConfig {
+        serde_json::from_value(json!({"root":"/tmp","operations":["read_file"]})).unwrap()
+    }
+
+    fn call(name: &str, arguments: &str) -> Value {
+        json!({"id":"call_1","type":"function","function":{"name":name,"arguments":arguments},"untrusted":"discard"})
+    }
+
+    fn response(calls: Vec<Value>) -> Vec<u8> {
+        serde_json::to_vec(&json!({"choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","content":null,"tool_calls":calls}}],"usage":{"prompt_tokens":12,"completion_tokens":3}})).unwrap()
+    }
+
+    fn error_code(
+        bytes: &[u8],
+        config: Option<&crate::workspace::WorkspaceConfig>,
+    ) -> &'static str {
+        match parse_completion(bytes, 1024, false, config) {
+            Err(error) => error.code,
+            Ok(_) => panic!("expected provider failure"),
+        }
+    }
+
+    #[test]
+    fn workspace_call_retains_only_protocol_fields_and_defers_argument_errors() {
+        let config = workspace();
+        let bytes = response(vec![call("workspace_read_file", "invalid JSON")]);
+        let parsed = match parse_completion(&bytes, 1024, false, Some(&config)) {
+            Ok(Turn::Tool(call)) => call,
+            _ => panic!("expected workspace call"),
+        };
+        assert_eq!(parsed.name, "workspace_read_file");
+        assert_eq!(parsed.arguments, "invalid JSON");
+        assert_eq!(parsed.usage.input_tokens, Some(12));
+        assert!(
+            parsed.assistant.tool_calls.unwrap()[0]
+                .get("untrusted")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_calls_require_one_enabled_bounded_call() {
+        let config = workspace();
+        let valid = call("workspace_read_file", r#"{"path":"file.txt"}"#);
+        assert_eq!(
+            error_code(&response(vec![valid.clone()]), None),
+            "unsupported_capability"
+        );
+        assert_eq!(
+            error_code(
+                &response(vec![call("workspace_search", "{}")]),
+                Some(&config)
+            ),
+            "unsupported_capability"
+        );
+        assert_eq!(
+            error_code(&response(vec![valid.clone(), valid.clone()]), Some(&config)),
+            "invalid_tool_call"
+        );
+        let mut bad_id = valid;
+        bad_id["id"] = json!("bad/id");
+        assert_eq!(
+            error_code(&response(vec![bad_id]), Some(&config)),
+            "invalid_tool_call"
+        );
+        assert_eq!(
+            error_code(
+                &response(vec![call(
+                    "workspace_read_file",
+                    &"x".repeat(16 * 1024 + 1)
+                )]),
+                Some(&config)
+            ),
+            "invalid_tool_call"
+        );
+    }
 }

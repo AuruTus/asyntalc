@@ -42,6 +42,8 @@ enum Command {
         max_active_runs: u64,
     },
     Ping,
+    /// Show the daemon's effective workspace permissions and provider destination.
+    Scope,
     /// Discover runs in submission order; continue from next_after.
     List {
         #[arg(long)]
@@ -157,6 +159,7 @@ pub async fn run(args: Cli) -> anyhow::Result<()> {
             .await;
         }
         Command::Ping => (Operation::Ping, false),
+        Command::Scope => (Operation::Scope, false),
         Command::List {
             session,
             status,

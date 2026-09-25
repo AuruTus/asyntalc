@@ -80,7 +80,7 @@ impl Store {
         let mut conn = Connection::open(path)?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         anyhow::ensure!(
-            version <= 4,
+            version <= 5,
             "database schema is newer than this executable"
         );
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -115,6 +115,11 @@ impl Store {
             anyhow::ensure!(violations == 0, "migration would violate foreign keys");
             tx.commit()?;
             conn.pragma_update(None, "foreign_keys", "ON")?;
+        }
+        if version < 5 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(include_str!("../migrations/005_workspace_tools.sql"))?;
+            tx.commit()?;
         }
         let profile_json = serde_json::to_string(profile)?;
         let mismatched: i64 = conn.query_row("SELECT count(*) FROM runs r JOIN sessions s ON s.id=r.session_id WHERE r.status IN ('queued','waiting_for_parent') AND r.deadline_at_ms > ?2 AND s.profile_json != ?1", params![profile_json, now_ms()], |r| r.get(0))?;
@@ -162,6 +167,10 @@ impl Store {
         self.call(|_| Ok(())).await
     }
 
+    pub fn scope(&self) -> anyhow::Result<Value> {
+        Ok(serde_json::from_str::<Profile>(&self.profile_json)?.scope())
+    }
+
     pub async fn submit(
         &self,
         session_id: Option<String>,
@@ -180,14 +189,16 @@ impl Store {
                     return Ok(serde_json::from_str(&receipt)?);
                 }
             }
-            let pending: i64 = tx.query_row("SELECT count(*) FROM runs WHERE status IN ('queued','running','waiting_for_parent')", [], |r| r.get(0))?;
-            if pending >= MAX_PENDING { return Err(StoreError("capacity_exceeded").into()); }
             let session_id = session_id.unwrap_or_else(|| format!("session_{}", uuid::Uuid::new_v4()));
             let run_id = format!("run_{}", uuid::Uuid::new_v4());
             let now = now_ms();
             tx.execute("INSERT OR IGNORE INTO sessions (id, created_at_ms, profile_json) VALUES (?1, ?2, ?3)", params![session_id, now, profile])?;
             let stored_profile: String = tx.query_row("SELECT profile_json FROM sessions WHERE id=?1", [&session_id], |r| r.get(0))?;
             if stored_profile != profile { return Err(StoreError("session_config_conflict").into()); }
+            let busy: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM runs WHERE session_id=?1 AND status IN ('queued','running','waiting_for_parent'))", [&session_id], |r| r.get(0))?;
+            if busy { return Err(StoreError("session_busy").into()); }
+            let pending: i64 = tx.query_row("SELECT count(*) FROM runs WHERE status IN ('queued','running','waiting_for_parent')", [], |r| r.get(0))?;
+            if pending >= MAX_PENDING { return Err(StoreError("capacity_exceeded").into()); }
             tx.execute("UPDATE sessions SET scheduler_order=(SELECT coalesce(max(scheduler_order),0)+1 FROM sessions) WHERE id=?1 AND NOT EXISTS (SELECT 1 FROM runs WHERE session_id=?1 AND status IN ('queued','running','waiting_for_parent'))", [&session_id])?;
             let deadline = now + run_timeout_ms as i64;
             tx.execute("INSERT INTO runs (id, session_id, input, status, revision, created_at_ms, deadline_at_ms) VALUES (?1, ?2, ?3, 'queued', 1, ?4, ?5)", params![run_id, session_id, input, now, deadline])?;
@@ -293,6 +304,12 @@ impl Store {
     }
 
     pub async fn mark_requested(&self, run_id: String) -> anyhow::Result<bool> {
+        let profile: Profile = serde_json::from_str(&self.profile_json)?;
+        let limit = if matches!(profile, Profile::Chat(config) if config.workspace.is_some()) {
+            25
+        } else {
+            9
+        };
         self.call(move |conn| {
             let tx = conn.transaction()?;
             if stop_if_due(&tx, &run_id, false)? {
@@ -300,7 +317,7 @@ impl Store {
                 return Ok(false);
             }
             let attempts: i64 = tx.query_row("SELECT model_requests FROM runs WHERE id=?1", [&run_id], |r| r.get(0))?;
-            if attempts >= 9 { return Err(StoreError("model_turn_limit").into()); }
+            if attempts >= limit { return Err(StoreError("model_turn_limit").into()); }
             let revision: i64 = tx.query_row("UPDATE runs SET model_requests=model_requests+1, revision=revision+1 WHERE id=?1 AND status='running' RETURNING revision", [&run_id], |r| r.get(0))?;
             event(&tx, &run_id, revision, "run.model_requested")?;
             tx.commit()?;
@@ -391,7 +408,7 @@ fn stop_if_due(tx: &rusqlite::Transaction<'_>, id: &str, cancel: bool) -> anyhow
 }
 
 fn finish_stop(tx: &rusqlite::Transaction<'_>, id: &str) -> anyhow::Result<()> {
-    let changed: Option<(i64,String)> = tx.query_row("UPDATE runs SET status=stop_reason,revision=revision+1,finished_at_ms=?2,input_tokens=CASE WHEN model_requests>(SELECT count(*) FROM questions WHERE run_id=?1) THEN NULL ELSE input_tokens END,output_tokens=CASE WHEN model_requests>(SELECT count(*) FROM questions WHERE run_id=?1) THEN NULL ELSE output_tokens END,error_code=stop_reason,error_message=CASE stop_reason WHEN 'cancelled' THEN 'Run cancelled by client' ELSE 'Run deadline exceeded' END WHERE id=?1 AND status IN ('queued','running','waiting_for_parent') AND stop_reason IS NOT NULL RETURNING revision,status", params![id,now_ms()], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let changed: Option<(i64,String)> = tx.query_row("UPDATE runs SET status=stop_reason,revision=revision+1,finished_at_ms=?2,input_tokens=CASE WHEN model_requests>((SELECT count(*) FROM questions WHERE run_id=?1)+(SELECT count(*) FROM tool_exchanges WHERE run_id=?1)) THEN NULL ELSE input_tokens END,output_tokens=CASE WHEN model_requests>((SELECT count(*) FROM questions WHERE run_id=?1)+(SELECT count(*) FROM tool_exchanges WHERE run_id=?1)) THEN NULL ELSE output_tokens END,error_code=stop_reason,error_message=CASE stop_reason WHEN 'cancelled' THEN 'Run cancelled by client' ELSE 'Run deadline exceeded' END WHERE id=?1 AND status IN ('queued','running','waiting_for_parent') AND stop_reason IS NOT NULL RETURNING revision,status", params![id,now_ms()], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
     if let Some((revision, status)) = changed {
         event(tx, id, revision, &format!("run.{status}"))?;
     }
@@ -463,3 +480,4 @@ mod parent;
 use parent::commit_questions;
 
 mod inspection;
+mod tools;

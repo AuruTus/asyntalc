@@ -259,7 +259,13 @@ fn restart_recovers_queued_work_without_replaying_active_work() {
     let mut daemon = Daemon::start(30_000);
     let active = daemon.submit("active");
     daemon.wait_running(&active);
-    let queued = daemon.submit("queued");
+    let blocker = daemon.rpc(json!({"op":"submit","session_id":"blocker","input":"blocker"}));
+    daemon.wait_running(blocker["run_id"].as_str().unwrap());
+    let queued =
+        daemon.rpc(json!({"op":"submit","session_id":"queued","input":"queued"}))["run_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
     assert_eq!(
         daemon.rpc(json!({"op":"status","run_id":queued}))["status"],
         "queued"

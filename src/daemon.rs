@@ -36,15 +36,11 @@ impl Drop for Ownership {
 
 pub async fn run(
     data_dir: PathBuf,
-    profile: Profile,
+    mut profile: Profile,
     fake_delay: Duration,
     max_active_runs: usize,
 ) -> anyhow::Result<()> {
     let runner_name = profile.name();
-    let provider = match &profile {
-        Profile::Fake => None,
-        Profile::Chat(config) => Some(ChatProvider::new(config.as_ref().clone())?),
-    };
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -54,6 +50,24 @@ pub async fn run(
         metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0,
         "data directory must be a private directory (mode 0700)"
     );
+    if let Profile::Chat(config) = &mut profile
+        && let Some(workspace) = &mut config.workspace
+    {
+        crate::config::exclude_private_path(workspace, &fs::canonicalize(&data_dir)?)?;
+    }
+    let provider = match &profile {
+        Profile::Fake => None,
+        Profile::Chat(config) => Some(ChatProvider::new(config.as_ref().clone())?),
+    };
+    let workspace = match &profile {
+        Profile::Chat(config) => config
+            .workspace
+            .clone()
+            .map(crate::workspace::Workspace::open)
+            .transpose()?
+            .map(Arc::new),
+        Profile::Fake => None,
+    };
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -89,6 +103,7 @@ pub async fn run(
             delay: fake_delay,
             profile,
             provider,
+            workspace,
         },
         max_active_runs,
         shutdown_rx,
@@ -234,6 +249,7 @@ async fn dispatch(
 ) -> anyhow::Result<serde_json::Value> {
     match &request.operation {
         Operation::Ping => Ok(json!({"ready": true, "runner": runner_name})),
+        Operation::Scope => store.scope(),
         Operation::List {
             session_id,
             status,

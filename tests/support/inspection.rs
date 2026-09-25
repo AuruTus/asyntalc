@@ -6,19 +6,26 @@ fn list(daemon: &Daemon, after: i64, limit: u32) -> Value {
     result
 }
 
+fn submit_independent(daemon: &Daemon, input: &str) -> String {
+    let reply = daemon.rpc(json!({"op":"submit","input":input}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    reply["run_id"].as_str().unwrap().into()
+}
+
 #[test]
 fn list_pages_survive_new_submissions_and_restart_and_filter_current_state() {
     let mut daemon = Daemon::start(30_000);
     let first = daemon.submit("private prompt not included in list");
     daemon.wait_running(&first);
-    let second = daemon.submit("second");
-    let third = daemon.submit("third");
+    let second = submit_independent(&daemon, "second");
+    daemon.wait_running(&second);
+    let third = submit_independent(&daemon, "third");
     let page1 = list(&daemon, 0, 2);
     assert_eq!(page1["runs"][0]["run_id"], first);
     assert_eq!(page1["runs"][1]["run_id"], second);
     assert_eq!(page1["has_more"], true);
     assert!(!page1.to_string().contains("private prompt"));
-    let fourth = daemon.submit("arrives between pages");
+    let fourth = submit_independent(&daemon, "arrives between pages");
     let page2 = list(&daemon, page1["next_after"].as_i64().unwrap(), 2);
     assert_eq!(page2["runs"][0]["run_id"], third);
     assert_eq!(page2["runs"][1]["run_id"], fourth);
@@ -27,13 +34,18 @@ fn list_pages_survive_new_submissions_and_restart_and_filter_current_state() {
     assert_eq!(empty["runs"], json!([]));
     assert_eq!(empty["next_after"], page2["next_after"]);
     assert_eq!(empty["has_more"], false);
-    let filtered = daemon.rpc(json!({"op":"list","session_id":"test","status":"queued"}));
-    assert_eq!(filtered["runs"].as_array().unwrap().len(), 3);
+    let filtered = daemon.rpc(json!({"op":"list","session_id":"test","status":"running"}));
+    assert_eq!(filtered["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["runs"][0]["run_id"], first);
     assert_eq!(
         daemon.rpc(json!({"op":"list","session_id":"missing"}))["runs"],
         json!([])
     );
     daemon.rpc(json!({"op":"cancel","run_id":second}));
+    assert_eq!(
+        daemon.rpc(json!({"op":"wait","run_id":second,"timeout_ms":2000}))["status"],
+        "cancelled"
+    );
     let cancelled = daemon.rpc(json!({"op":"list","status":"cancelled"}));
     assert_eq!(cancelled["runs"].as_array().unwrap().len(), 1);
     assert_eq!(cancelled["runs"][0]["run_id"], second);
@@ -82,12 +94,9 @@ fn logs_are_finite_ordered_pages_and_poll_from_last_sequence() {
 fn inspection_cli_bounds_errors_and_maximum_page_remain_valid_json() {
     let daemon = Daemon::start(30_000);
     for i in 0..101 {
-        daemon.submit(&format!("prompt {i}"));
+        submit_independent(&daemon, &format!("prompt {i}"));
     }
-    let output = cli(
-        daemon.dir.path(),
-        &["list", "--session", "test", "--limit", "100"],
-    );
+    let output = cli(daemon.dir.path(), &["list", "--limit", "100"]);
     assert!(output.status.success());
     assert!(output.stdout.len() < 1024 * 1024);
     let page: Value = serde_json::from_slice(&output.stdout).unwrap();

@@ -11,7 +11,7 @@ impl Store {
                 return Ok(());
             }
             let count: i64 = tx.query_row("SELECT count(*) FROM questions WHERE run_id=?1", [&work.run_id], |r| r.get(0))?;
-            let duplicate: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND call_id=?2)", params![work.run_id,question.call_id], |r| r.get(0))?;
+            let duplicate: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM questions WHERE run_id=?1 AND call_id=?2 UNION ALL SELECT 1 FROM tool_exchanges WHERE run_id=?1 AND call_id=?2)", params![work.run_id,question.call_id], |r| r.get(0))?;
             add_usage(&tx,&work.run_id,&question.usage)?;
             if count >= 8 || duplicate {
                 let code = if duplicate { "invalid_parent_question" } else { "question_limit" };
@@ -20,7 +20,7 @@ impl Store {
             } else {
                 let id = format!("q_{}",uuid::Uuid::new_v4());
                 let public = json!({"question_id":id,"kind":"question","prompt":question.prompt,"choices":question.choices,"allows_free_text":true});
-                tx.execute("INSERT INTO questions(id,run_id,ordinal,call_id,question_json,assistant_json) VALUES (?1,?2,?3,?4,?5,?6)", params![id,work.run_id,count+1,question.call_id,public.to_string(),serde_json::to_string(&question.assistant)?])?;
+                tx.execute("INSERT INTO questions(id,run_id,ordinal,call_id,question_json,assistant_json,model_turn) VALUES (?1,?2,?3,?4,?5,?6,(SELECT model_requests FROM runs WHERE id=?2))", params![id,work.run_id,count+1,question.call_id,public.to_string(),serde_json::to_string(&question.assistant)?])?;
                 let revision: i64 = tx.query_row("UPDATE runs SET status='waiting_for_parent',revision=revision+1 WHERE id=?1 RETURNING revision", [&work.run_id], |r|r.get(0))?;
                 event(&tx,&work.run_id,revision,"run.waiting_for_parent")?;
             }
@@ -67,7 +67,8 @@ impl Store {
             // Bound both committed content and current run's question/answer transcript before allocation.
             let (history_bytes, history_count): (i64,i64) = conn.query_row("SELECT coalesce(sum(length(CAST(m.content AS BLOB))+coalesce(length(CAST(m.tool_calls AS BLOB)),0)+coalesce(length(m.tool_call_id),0)),0),count(*) FROM messages m JOIN runs r ON r.id=m.run_id WHERE r.session_id=?1 AND r.status='completed' AND r.queue_position<(SELECT queue_position FROM runs WHERE id=?2)", params![session_id,run_id], |r|Ok((r.get(0)?,r.get(1)?)))?;
             let (local_bytes, local_count): (i64,i64) = conn.query_row("SELECT coalesce(sum(length(CAST(assistant_json AS BLOB))+length(CAST(answer AS BLOB))+length(call_id)),0),count(*)*2 FROM questions WHERE run_id=?1 AND answer IS NOT NULL", [&run_id], |r|Ok((r.get(0)?,r.get(1)?)))?;
-            if history_bytes as u64 + local_bytes as u64 + input.len() as u64 > max_bytes as u64 || history_count+local_count>=1023 { return Err(StoreError("context_limit").into()); }
+            let (tool_bytes, tool_count): (i64,i64) = conn.query_row("SELECT coalesce(sum(length(CAST(assistant_json AS BLOB))+length(CAST(result_json AS BLOB))+length(call_id)),0),count(*)*2 FROM tool_exchanges WHERE run_id=?1", [&run_id], |r|Ok((r.get(0)?,r.get(1)?)))?;
+            if history_bytes as u64 + local_bytes as u64 + tool_bytes as u64 + input.len() as u64 > max_bytes as u64 || history_count+local_count+tool_count>=1023 { return Err(StoreError("context_limit").into()); }
             let mut query = conn.prepare("SELECT m.role,m.content,m.tool_calls,m.tool_call_id FROM messages m JOIN runs r ON r.id=m.run_id WHERE r.session_id=?1 AND r.status='completed' AND r.queue_position<(SELECT queue_position FROM runs WHERE id=?2) ORDER BY r.queue_position,m.id")?;
             let mut messages = query.query_map(params![session_id,run_id], |r| Ok(Message {role:r.get(0)?,content:r.get(1)?,tool_calls:r.get::<_,Option<String>>(2)?.map(|s|serde_json::from_str(&s).expect("stored tool calls")),tool_call_id:r.get(3)?}))?.collect::<Result<Vec<_>,_>>()?;
             messages.push(Message::text("user",input));
@@ -78,7 +79,7 @@ impl Store {
 }
 
 fn question_messages(conn: &Connection, run_id: &str) -> anyhow::Result<Vec<Message>> {
-    let mut query = conn.prepare("SELECT assistant_json,call_id,answer FROM questions WHERE run_id=?1 AND answer IS NOT NULL ORDER BY ordinal")?;
+    let mut query = conn.prepare("SELECT assistant_json,call_id,content FROM (SELECT assistant_json,call_id,answer AS content,model_turn FROM questions WHERE run_id=?1 AND answer IS NOT NULL UNION ALL SELECT assistant_json,call_id,result_json AS content,model_turn FROM tool_exchanges WHERE run_id=?1) ORDER BY model_turn")?;
     let rows = query.query_map([run_id], |r| {
         Ok((
             r.get::<_, String>(0)?,

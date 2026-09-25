@@ -228,15 +228,14 @@ fn chat_uses_committed_history_and_survives_restart() {
         json!({"model":"test-model","stream":false,"max_completion_tokens":123,"messages":[{"role":"developer","content":"Be concise"},{"role":"user","content":"Remember alpha"}]})
     );
     // The real request is gated at the mock server, not by timing assumptions.
-    let second = daemon.submit("What did I say?");
+    assert_eq!(
+        daemon.rpc(json!({"op":"submit","session_id":"test","input":"What did I say?"}))["error"]["code"],
+        "session_busy"
+    );
     let pending = daemon.rpc(json!({"op":"wait","run_id":first,"timeout_ms":0}));
     assert_eq!(pending["phase"], "model_request");
     assert_eq!(pending["return_reason"], "wait_timeout");
     assert_eq!(pending["usage"]["model_requests"], 1);
-    assert_eq!(
-        daemon.rpc(json!({"op":"status","run_id":second}))["status"],
-        "queued"
-    );
     api.reply(Reply::Json(200, answer("I remember alpha")));
     let first_result = wait(&daemon, &first);
     assert_eq!(first_result["result"]["text"], "I remember alpha");
@@ -244,6 +243,7 @@ fn chat_uses_committed_history_and_survives_restart() {
         first_result["usage"],
         json!({"model_requests":1,"input_tokens":7,"output_tokens":3})
     );
+    let second = daemon.submit("What did I say?");
     let request = api.request();
     assert_eq!(
         request.body["messages"],
@@ -276,7 +276,7 @@ fn chat_uses_committed_history_and_survives_restart() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
     let profile: String = db
         .query_row(
@@ -482,7 +482,7 @@ fn embedded_migration_preserves_v1_results_and_sessions() {
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
             .unwrap(),
-        4
+        5
     );
 }
 
@@ -528,9 +528,13 @@ fn configuration_requires_credentials_and_rejects_embedded_secrets() {
 fn interrupted_chat_is_not_replayed_and_queued_chat_keeps_its_profile() {
     let api = MockApi::start();
     let mut daemon = start_chat(&api, "");
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    daemon.child = spawn_chat_with_limit(daemon.dir.path(), 1);
+    daemon.ready();
     let active = daemon.submit("interrupted");
     api.request();
-    let queued = daemon.submit("queued");
+    let queued = chat_submit(&daemon, "queued", "queued");
     daemon.child.kill().unwrap();
     daemon.child.wait().unwrap();
     api.reply(Reply::Disconnect);
@@ -703,16 +707,15 @@ fn concurrent_http_requests_preserve_fifo_history_and_release_cancelled_session(
     let (listener, daemon) = gated_chat();
     let a = chat_submit(&daemon, "a", "a1");
     let (mut a_socket, _) = accept_request(&listener);
-    let a2 = chat_submit(&daemon, "a", "a2");
+    assert_eq!(
+        daemon.rpc(json!({"op":"submit","session_id":"a","input":"a2"}))["error"]["code"],
+        "session_busy"
+    );
     let b = chat_submit(&daemon, "b", "b1");
     let (mut b_socket, b_request) = accept_request(&listener);
     assert_eq!(
         b_request.body["messages"],
         json!([{"role":"user","content":"b1"}])
-    );
-    assert_eq!(
-        daemon.rpc(json!({"op":"status","run_id":a2}))["status"],
-        "queued"
     );
     let c = chat_submit(&daemon, "c", "c1");
     assert_eq!(
@@ -733,6 +736,7 @@ fn concurrent_http_requests_preserve_fifo_history_and_release_cancelled_session(
     assert_eq!(cancelled["usage"]["model_requests"], 1);
     // The local request has been dropped before A2 may claim the session.
     assert_eq!(a_socket.read(&mut [0_u8; 1]).unwrap(), 0);
+    let a2 = chat_submit(&daemon, "a", "a2");
     let (mut a2_socket, a2_request) = accept_request(&listener);
     assert_eq!(
         a2_request.body["messages"],
@@ -798,3 +802,6 @@ fn run_deadline_drops_active_http_request_without_history() {
 
 #[path = "parent_questions.rs"]
 mod parent_questions;
+
+#[path = "workspace_tools.rs"]
+mod workspace_tools;

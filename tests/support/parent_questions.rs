@@ -41,10 +41,9 @@ fn parent_question_survives_restart_and_resume_commits_full_history() {
     assert_eq!(discovered["runs"][0]["run_id"], a);
     assert_eq!(discovered["runs"][0]["question_id"], q["question_id"]);
     assert!(!discovered.to_string().contains("Which option?"));
-    let a2 = daemon.submit("second");
     assert_eq!(
-        daemon.rpc(json!({"op":"status","run_id":a2}))["blocked_by_run_id"],
-        a
+        daemon.rpc(json!({"op":"submit","session_id":"test","input":"second"}))["error"]["code"],
+        "session_busy"
     );
     let b = chat_submit(&daemon, "independent", "other");
     assert_eq!(
@@ -100,6 +99,7 @@ fn parent_question_survives_restart_and_resume_commits_full_history() {
         done["usage"],
         json!({"model_requests":2,"input_tokens":14,"output_tokens":6})
     );
+    let a2 = daemon.submit("second");
     let next = api.request();
     assert_eq!(next.body["messages"].as_array().unwrap().len(), 5);
     assert_eq!(next.body["messages"][2]["tool_call_id"], "call_a");

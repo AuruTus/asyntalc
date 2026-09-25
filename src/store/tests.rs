@@ -60,6 +60,101 @@ async fn messages(store: &Store) -> i64 {
 }
 
 #[tokio::test]
+async fn unfinished_session_rejects_new_work_but_retries_survive_every_state() {
+    let (_dir, store) = setup();
+    let receipt = store
+        .submit(
+            Some("a".into()),
+            "prompt".into(),
+            600_000,
+            Some("retry".into()),
+        )
+        .await
+        .unwrap();
+    let id = receipt["run_id"].as_str().unwrap().to_owned();
+    for stage in [
+        "queued",
+        "running",
+        "waiting_for_parent",
+        "resumed",
+        "cancelling",
+    ] {
+        match stage {
+            "running" => {
+                store.claim().await.unwrap().unwrap();
+            }
+            "waiting_for_parent" => {
+                store.mark_requested(id.clone()).await.unwrap();
+                store
+                    .pause(
+                        Work {
+                            run_id: id.clone(),
+                            session_id: "a".into(),
+                            input: "prompt".into(),
+                        },
+                        question("busy_call"),
+                    )
+                    .await
+                    .unwrap();
+            }
+            "resumed" => {
+                let question = store
+                    .snapshot(id.clone(), true)
+                    .await
+                    .unwrap()
+                    .input_request
+                    .unwrap();
+                store
+                    .resume(
+                        id.clone(),
+                        question["question_id"].as_str().unwrap().into(),
+                        "answer".into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            "cancelling" => {
+                store.claim().await.unwrap().unwrap();
+                store.cancel(id.clone()).await.unwrap();
+                assert_eq!(
+                    store.snapshot(id.clone(), true).await.unwrap().status,
+                    "running"
+                );
+            }
+            _ => {}
+        }
+        let error = store
+            .submit(Some("a".into()), "other".into(), 600_000, None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<StoreError>().unwrap().0,
+            "session_busy",
+            "stage {stage}"
+        );
+        assert_eq!(
+            store
+                .submit(
+                    Some("a".into()),
+                    "prompt".into(),
+                    600_000,
+                    Some("retry".into())
+                )
+                .await
+                .unwrap(),
+            receipt,
+            "stage {stage}"
+        );
+    }
+    store
+        .fail(id.clone(), Failure::new("stopped", "stopped"))
+        .await
+        .unwrap();
+    assert_eq!(store.snapshot(id, true).await.unwrap().status, "cancelled");
+    submit(&store, "a").await;
+}
+
+#[tokio::test]
 async fn first_stop_wins_and_late_completion_cannot_write_history() {
     let (_dir, store) = setup();
     let id = submit(&store, "a").await;
@@ -122,10 +217,14 @@ async fn deadline_is_checked_at_request_and_completion_without_scheduler_sweep()
 }
 
 #[tokio::test]
-async fn session_fifo_and_round_robin_survive_reopen() {
+async fn legacy_session_queue_and_round_robin_survive_reopen() {
     let (dir, store) = setup();
     let a1 = submit(&store, "a").await;
-    let a2 = submit(&store, "a").await;
+    let a2 = "previously-accepted".to_owned();
+    store.call(|c| {
+        c.execute("INSERT INTO runs(id,session_id,input,status,revision,created_at_ms,deadline_at_ms) VALUES ('previously-accepted','a','prompt','queued',1,?1,?2)", params![now_ms(), now_ms()+600_000])?;
+        Ok(())
+    }).await.unwrap();
     let b1 = submit(&store, "b").await;
     let a = store.claim().await.unwrap().unwrap();
     assert_eq!(a.run_id, a1);
@@ -152,7 +251,7 @@ async fn recovery_preserves_stop_requests_and_expires_queued_runs() {
     let active = submit(&store, "a").await;
     store.claim().await.unwrap().unwrap();
     store.cancel(active.clone()).await.unwrap();
-    let queued = submit(&store, "a").await;
+    let queued = submit(&store, "queued").await;
     expire(&store, &queued).await;
     let timed = submit(&store, "b").await;
     store.claim().await.unwrap().unwrap();
@@ -391,7 +490,14 @@ async fn fast_resume_waits_for_old_task_and_keeps_fifo_position() {
     let (_dir, store) = setup();
     let id = submit(&store, "a").await;
     let q = pause(&store, &id).await;
-    let next = submit(&store, "a").await;
+    let error = store
+        .submit(Some("a".into()), "next".into(), 600_000, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<StoreError>().unwrap().0,
+        "session_busy"
+    );
     store.resume(id.clone(), q, "answer".into()).await.unwrap();
     assert!(
         store
@@ -399,10 +505,6 @@ async fn fast_resume_waits_for_old_task_and_keeps_fifo_position() {
             .await
             .unwrap()
             .is_none()
-    );
-    assert_eq!(
-        store.snapshot(next, false).await.unwrap().blocked_by_run_id,
-        Some(id.clone())
     );
     let work = store.claim().await.unwrap().unwrap();
     assert_eq!(work.run_id, id);

@@ -39,6 +39,8 @@ printf 'Inspect the durable run' >"$demo_dir/prompt.txt"
   --idempotency-key first >"$demo_dir/receipt.json"
 "$demo_bin" --data-dir "$demo_dir" submit --session demo --input "$demo_dir/prompt.txt" \
   --idempotency-key first >"$demo_dir/retry.json"
+demo_first_run="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["run_id"])' "$demo_dir/receipt.json")"
+"$demo_bin" --data-dir "$demo_dir" wait --run "$demo_first_run" --timeout-ms 5000 >"$demo_dir/first-wait.json"
 "$demo_bin" --data-dir "$demo_dir" submit --session demo --input "$demo_dir/prompt.txt" \
   --idempotency-key second >"$demo_dir/second.json"
 # Rediscover handles without relying on the submit receipt.
