@@ -1,5 +1,6 @@
 use std::{
     path::Path,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -19,8 +20,23 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 
 #[derive(Clone)]
 pub struct Store {
-    sender: mpsc::Sender<Job>,
+    worker: Arc<DatabaseWorker>,
     profile_json: String,
+}
+
+struct DatabaseWorker {
+    sender: Option<mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for DatabaseWorker {
+    fn drop(&mut self) {
+        // Closing SQLite must finish before this database can be reopened.
+        drop(self.sender.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -108,7 +124,7 @@ impl Store {
         );
         recover(&mut conn)?;
         let (sender, mut receiver) = mpsc::channel::<Job>(64);
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("asyntalc-store".into())
             .spawn(move || {
                 while let Some(job) = receiver.blocking_recv() {
@@ -116,7 +132,10 @@ impl Store {
                 }
             })?;
         Ok(Self {
-            sender,
+            worker: Arc::new(DatabaseWorker {
+                sender: Some(sender),
+                thread: Some(thread),
+            }),
             profile_json,
         })
     }
@@ -127,7 +146,10 @@ impl Store {
         F: FnOnce(&mut Connection) -> anyhow::Result<T> + Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
-        self.sender
+        self.worker
+            .sender
+            .as_ref()
+            .expect("live database worker")
             .send(Box::new(move |conn| {
                 let _ = tx.send(job(conn));
             }))

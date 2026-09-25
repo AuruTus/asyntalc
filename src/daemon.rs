@@ -139,6 +139,7 @@ pub async fn run(
     // All accepted DB jobs finish before the store barrier returns. Keep the lock until then.
     // Store clones held by aborted tasks have now been dropped.
     store.barrier().await?;
+    drop(store);
     outcome
 }
 

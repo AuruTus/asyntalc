@@ -5,6 +5,27 @@ fn setup() -> (tempfile::TempDir, Store) {
     let store = Store::open(&dir.path().join("state.sqlite3"), &Profile::Fake).unwrap();
     (dir, store)
 }
+
+#[tokio::test]
+async fn last_store_owner_closes_worker_before_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite3");
+    for iteration in 0..32 {
+        let store = Store::open(&path, &Profile::Fake).unwrap();
+        let remaining_owner = store.clone();
+        drop(store);
+        let id = submit(&remaining_owner, &format!("session{iteration}")).await;
+        let work = remaining_owner.claim().await.unwrap().unwrap();
+        remaining_owner.complete(work, answer()).await.unwrap();
+        assert_eq!(
+            remaining_owner.snapshot(id, false).await.unwrap().status,
+            "completed"
+        );
+        drop(remaining_owner);
+        assert!(!dir.path().join("state.sqlite3-wal").exists());
+        assert!(!dir.path().join("state.sqlite3-shm").exists());
+    }
+}
 async fn submit(store: &Store, session: &str) -> String {
     store
         .submit(Some(session.into()), "prompt".into(), 600_000, None)
