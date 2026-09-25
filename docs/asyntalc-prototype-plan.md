@@ -1,12 +1,12 @@
 # Asyntalc prototype plan
 
-Status: Milestones 1–2 implemented; one-request live DeepSeek validation passed. Version 0.1.1, updated 2026-09-19.
+Status: Milestones 1–6 implemented. Version 0.1.5, updated 2026-09-25. Validation evidence for the newest slice is recorded in section 16.
 Based on [the v0.1 design](asyntalc-design-v0.1.md).
 Provider decision: an OpenAI-compatible Chat Completions API, with configurable endpoint and model.
 
-**Current verdict:** version 0.1.4 completes the five planned milestones for the bounded async text prototype: durable client/daemon execution, Chat requests, concurrent sessions, parent questions/resume, and paginated run/event inspection. See [section 15](#15-milestone-5-run-discovery-and-lifecycle-inspection) for current usage and validation. This is still a subset of the broader v0.1 design: workspace tools, sandbox execution, and retention remain outside this prototype. Sections 10–14 preserve earlier milestone exhibitions.
+**Current verdict:** version 0.1.5 adds read-only workspace tools and rejects new work on occupied sessions. See [section 16](#16-milestone-6-read-only-workspace-and-session-admission) for the architecture and usage. The CLI follows the v0.1 async contract: commit a receipt, inspect or wait, resume a parent question, and retrieve a durable result. File mutation, shell execution, sandbox isolation, and retention remain outside this prototype. Sections 10–15 preserve earlier milestone exhibitions, including the previous same-session queuing policy.
 
-Sections 1–9 describe the target prototype, including work that remains unimplemented. The provider adapter now exists; the separate concurrent scheduler remains planned.
+Sections 1–9 describe the original target prototype. The provider adapter and concurrent scheduler are implemented; section 16 supersedes earlier session-admission and workspace assumptions.
 
 The first prototype should prove that a parent can submit several tasks, exit, and later retrieve durable results. Build one Rust binary with a short-lived client and a separately started daemon. Add parent clarification after the basic request lifecycle works; add workspace tools and isolation afterward.
 
@@ -797,3 +797,79 @@ The milestone-4 test stall is documented in its handoff; it was not reproduced i
 The five-milestone text prototype is now usable through the CLI: submit → discover → wait → answer a parent question if needed → collect result → inspect lifecycle. Earlier tests retain coverage for independent-session overlap, FIFO, multiple waiters, bounded waits, cancellation/deadline races, durable retries, and interrupted-run recovery. Real text requests were smoke-tested against DeepSeek in milestone 2; parent function-call compatibility has only local mock-server evidence.
 
 No automatic retention or deletion is introduced. Runs, events, questions, and submit/resume receipts persist together; deleting them would change retry guarantees and needs a defined policy. The broader v0.1 design still needs workspace access, tool execution and sandbox isolation, plus its deferred convenience/configuration features. The next implementation slice should define read-only workspace access and its boundary before enabling file mutation or shell execution.
+
+## 16. Milestone 6: read-only workspace and session admission
+
+Version **0.1.5**, schema **5**, protocol **1**. This slice tests two hypotheses: rejecting a second unfinished turn gives each session a clear owner without session versions; and a bounded, read-only tool loop can inspect an explicit workspace while preserving the existing async receipt/wait/result contract. The baseline is milestone 5's same-session queue and text/parent-only provider loop. Admission tests vary the first run's state while keeping the second submission fixed. Tool tests use local mock Chat responses and known files, with no live provider cost.
+
+### Architecture and concurrency
+
+```mermaid
+flowchart LR
+    Parent[Parent or CLI] -->|submit / resume / inspect| Daemon
+    Daemon --> Store[Single SQLite worker]
+    Daemon --> Scheduler[Bounded scheduler]
+    Scheduler --> Run[One worker per active run]
+    Run -->|messages and tool definitions| API[Chat Completions endpoint]
+    API -->|final / question / tool call| Run
+    Run -->|validated read-only call| Workspace[Root directory descriptor]
+    Run -->|persist tool exchange| Store
+    Store -->|successful history plus current exchanges| Run
+```
+
+The submit transaction checks retries first, then session configuration and occupancy. A queued, running, or waiting-for-parent run makes a new submission fail with `session_busy`. A parent answer resumes the existing run. Active cancellation retains the session until execution cleanup finishes; a cancel acknowledgement alone does not permit another turn. Other sessions continue within `--max-active-runs`. Previously accepted queues from older binaries still drain in their original order.
+
+SQLite makes the admission check and insert atomic. The application defines the occupancy rule; the database does not infer conversation ownership. There is no session version, optimistic compare-and-swap, or application MVCC. `session_id` selects history, `run_id` selects execution, and run `revision` tracks lifecycle changes. This rule protects one session, not shared files across separate sessions. Read-only tools do not introduce framework file-write competition.
+
+Each successful model tool response preserves its assistant `tool_calls` message and pairs it with a `role: tool` result using the same `tool_call_id`, following the [Chat function-calling contract](https://developers.openai.com/api/docs/guides/function-calling). Parallel tool calls are disabled and multiple calls in one response are rejected. Tool exchanges and answered parent questions are ordered by model turn. Schema 5 backfills existing question order and adds durable tool exchanges; all SQL remains embedded in the binary.
+
+Workspace operations run between model requests, with no open database transaction. The same run then requests the next model turn. A parent question persists and releases the global execution slot, while retaining the session. Only successful completion commits the entire user/tool/parent/final transcript to reusable history. Failed or interrupted runs cannot contaminate later conversation context. An interrupted model/tool loop is not automatically replayed after restart.
+
+### Configuration and exhibition
+
+Copy `examples/provider.toml`, choose the endpoint/model and key environment-variable name, then enable:
+
+```toml
+[workspace]
+root = "/absolute/path/to/project"
+operations = ["read_file", "list_files", "search"]
+exclude = [".git", ".env", ".asyntalc", "secrets", "target"]
+max_file_bytes = 65536
+max_entries = 1000
+max_results = 100
+```
+
+```bash
+# Terminal 1, after exporting the configured key through your usual mechanism.
+asyntalc --data-dir .asyntalc daemon --config provider.toml
+
+# Terminal 2: inspect permissions before submitting workspace work.
+asyntalc --data-dir .asyntalc scope
+printf 'Read Cargo.toml and explain the runtime dependencies.' |
+  asyntalc --data-dir .asyntalc submit --session source-review --input -
+asyntalc --data-dir .asyntalc wait --run RUN_ID --timeout-ms 20000
+asyntalc --data-dir .asyntalc result --run RUN_ID --output text
+asyntalc --data-dir .asyntalc logs --run RUN_ID
+```
+
+The prompt asks the model to use a tool; a real model's choice is not deterministic. Local mock-provider tests explicitly emit tool calls to validate the execution path. If a wait returns `input_required`, answer the returned question with `resume`; if it returns `wait_timeout`, wait again. A submission to `source-review` before the first run finishes returns `session_busy`; an identical keyed retry returns the first receipt. After completion, a follow-up in that session receives the observed file contents and hashes in history, even if the live file has since changed. Reading again obtains new bytes.
+
+`scope` returns the effective workspace policy plus provider URL/model and enabled parent-question capability. It omits credentials and system instructions. File contents selected by tools can be sent to this provider and retained in local history. Mandatory exclusions include `.git`, `.env`, `.asyntalc`, and the daemon config/data paths when beneath the root. A single-component exclusion matches at any depth; a slash-separated exclusion is a relative subtree prefix. Other secret names require explicit exclusions. Policy is part of session identity; changing it requires a new session, and pending runs require their original policy on restart.
+
+### Boundaries
+
+Workspace tools accept relative paths and access a held root descriptor using Linux `openat2`. Symlinks, parent traversal, mount crossings below the root, and special-file reads are rejected. Reads are UTF-8 and return SHA-256 hashes; search is literal. Traversal, file bytes, matches, aggregate scan bytes, and serialized results are bounded. A run allows at most 16 workspace calls, 8 parent questions, and 25 model requests with workspace enabled (9 without it).
+
+Files remain live, not snapshot-isolated. Hashes identify observed bytes, including any mixture an external concurrent writer could produce. The boundary trusts the configured root and local filesystem; it does not isolate a hostile same-user process, prevent hard-link aliases created by that user, or guarantee a wall-clock bound on stalled filesystem I/O. File writes, shell commands, arbitrary process execution, per-session worktrees, automatic context summarization, and retention remain deferred.
+
+### Validation results
+
+On Rust/Cargo 1.98.1, the final suite passed **22 unit tests and 39 integration tests**; one paid live test stayed ignored. `cargo fmt --all -- --check`, `cargo clippy --locked --offline --all-targets -- -D warnings`, `cargo build --locked --offline --all-targets`, and `cargo test --locked --offline` passed. Run the deterministic workspace exhibition alone with:
+
+```bash
+cargo test --locked --offline --test client_daemon chat_provider::workspace_tools
+```
+
+Those five tests validate scoped capabilities, mixed workspace/parent history across restart, denied paths plus list/search, private config/data exclusions, and duplicate/runaway calls. Unit tests cover symlink-swap races, held-root replacement, special files, UTF-8 and size/traversal bounds. Simultaneous-parent tests prove exactly one new submission succeeds while the other returns `session_busy`; exact retries retain their original receipt.
+
+Validation also exposed a database-worker teardown race. GDB caught SQLite's open path holding the global Unix mutex while waiting for an inode mutex, with the old worker's close path holding the inode mutex while waiting for the global mutex. Final store drop now joins the worker, and daemon shutdown closes the store before releasing directory ownership. A regression verifies 32 close/reopen cycles, and three repeated full unit runs passed after the fix before the final combined suite. See the [milestone handoff](../knowledge-base/milestone-6-workspace-tools.md) for evidence and remaining boundaries.
