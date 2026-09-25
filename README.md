@@ -234,7 +234,18 @@ cargo test --locked --test client_daemon chat_provider::live_chat_smoke -- --ign
 
 The live test uses a temporary data directory and removes it afterward. It is ignored by default. Local adapter tests are not a substitute for checking compatibility with your actual endpoint and model.
 
-Version 0.1.5 validation on Rust/Cargo 1.98.1: **61 local tests passed**, with the paid live test ignored. Formatting, the locked all-target build, and Clippy passed. The suite also runs the Bash/Python inspection demo. Workspace function calls have local mock-provider evidence; the earlier DeepSeek smoke test covered text requests only. No new live request was made.
+For workspace tools, parent resume, and history, run the separate opt-in test from a shell containing the configured key:
+
+```bash
+ASYNTALC_LIVE_CONFIG=examples/deepseek.toml \
+cargo test --locked --test client_daemon \
+  chat_provider::live_workspace::live_workspace_smoke \
+  -- --ignored --exact --nocapture
+```
+
+It uses generated temporary files, enables read/list/search and parent questions, and expects six billable model requests. It copies endpoint/model/credential-variable and adapter settings from the selected profile, while replacing workspace, instructions, timeouts, and output limits for the test. It never exposes the repository as its workspace. The successful follow-up must reproduce the answer from history after the fixture file has been deleted. Both live tests are ignored by default.
+
+Version 0.1.5 validation on Rust/Cargo 1.98.1: **61 local tests passed**. Formatting, the locked all-target build, and Clippy passed. The suite also runs the Bash/Python inspection demo. The user subsequently ran the workspace smoke test against DeepSeek successfully: six model requests, including parent resume and follow-up history. See the [live validation evidence](knowledge-base/deepseek-workspace-live-validation.md) for the results and limits.
 
 Repeated validation exposed a database close/reopen deadlock: reopening could race the previous worker's SQLite destructor. Final store cleanup now joins that worker before reopening or releasing daemon ownership. A 32-cycle regression and repeated parallel unit runs pass; the [handoff](knowledge-base/milestone-6-workspace-tools.md) records the debugger evidence.
 

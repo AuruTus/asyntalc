@@ -805,3 +805,6 @@ mod parent_questions;
 
 #[path = "workspace_tools.rs"]
 mod workspace_tools;
+
+#[path = "live_workspace.rs"]
+mod live_workspace;
