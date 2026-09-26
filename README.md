@@ -216,6 +216,8 @@ This Linux implementation requires `openat2` and `/proc/self/fd`. Access is root
 
 ## Validation
 
+For a parent-managed three-reviewer workflow and synthesis, see the [swarm demo](examples/swarm-demo.md). It includes a runnable live script and no-API rehearsals.
+
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
