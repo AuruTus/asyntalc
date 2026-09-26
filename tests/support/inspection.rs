@@ -1,5 +1,41 @@
 use super::*;
 
+#[test]
+fn tools_validates_pages_and_returns_empty_for_runs_without_workspace_calls() {
+    let daemon = Daemon::start(30_000);
+    let run = daemon.submit("no tools yet");
+    let page = daemon.rpc(json!({"op":"tools","run_id":run}));
+    assert_eq!(page["ok"], true);
+    assert_eq!(page["tools"], json!([]));
+    assert_eq!(page["next_after"], 0);
+    for (operation, code) in [
+        (json!({"op":"tools","run_id":"missing"}), "run_not_found"),
+        (
+            json!({"op":"tools","run_id":run,"after":-1}),
+            "invalid_cursor",
+        ),
+        (
+            json!({"op":"tools","run_id":run,"limit":0}),
+            "invalid_limit",
+        ),
+        (
+            json!({"op":"tools","run_id":run,"limit":101}),
+            "invalid_limit",
+        ),
+    ] {
+        assert_eq!(daemon.rpc(operation)["error"]["code"], code);
+    }
+    assert_eq!(
+        cli(
+            daemon.dir.path(),
+            &["tools", "--run", &run, "--limit", "101"]
+        )
+        .status
+        .code(),
+        Some(2)
+    );
+}
+
 fn list(daemon: &Daemon, after: i64, limit: u32) -> Value {
     let result = daemon.rpc(json!({"op":"list","after":after,"limit":limit}));
     assert_eq!(result["ok"], true, "{result}");

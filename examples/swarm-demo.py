@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import sqlite3
 import subprocess
 import tempfile
 import time
@@ -208,20 +207,19 @@ def main():
         require(set(runs) == set(receipts), "discovery did not recover the review sessions")
         snapshots = collect(client, runs, evidence, args.parent_answer, args.fake)
         if not args.fake:
-            with sqlite3.connect(f"file:{client.directory / 'state.sqlite3'}?mode=ro", uri=True) as db:
-                tool_evidence = {}
-                for role, run in runs.items():
-                    calls = []
-                    for assistant, result in db.execute(
-                            "SELECT assistant_json,result_json FROM tool_exchanges WHERE run_id=? ORDER BY model_turn", (run,)):
-                        call = json.loads(assistant)["tool_calls"][0]["function"]
-                        value = json.loads(result)
-                        calls.append({"name": call["name"], "result": value})
-                    read = {call["result"].get("path") for call in calls
-                            if call["name"] == "workspace_read_file" and call["result"].get("ok")}
-                    require(set(FIXTURES) <= read, f"{role} did not read all fixture files")
-                    tool_evidence[role] = calls
-                save(evidence / "tool-evidence.json", tool_evidence)
+            tool_evidence = {}
+            for role, run in runs.items():
+                calls, after = [], 0
+                while True:
+                    page = client.call("tools", "--run", run, "--after", str(after), "--limit", "20")
+                    calls.extend(page["tools"])
+                    if not page["has_more"]:
+                        break
+                    after = page["next_after"]
+                read = {call["path"] for call in calls if call["name"] == "workspace_read_file" and call["ok"]}
+                require(set(FIXTURES) <= read, f"{role} did not read all fixture files")
+                tool_evidence[role] = calls
+            save(evidence / "tool-evidence.json", tool_evidence)
         reviews = "\n\n".join(f"## {role}\n{(evidence / f'{role}.md').read_text()}" for role in runs)
         prompt = ("Act as the parent coordinator. Using only the three reviews below, produce one short consolidated review. "
                   "Deduplicate findings, identify agreement or disagreement, and list the top three next actions. "

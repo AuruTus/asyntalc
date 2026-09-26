@@ -37,6 +37,13 @@ pub struct Request {
 pub enum Operation {
     Ping,
     Scope,
+    Tools {
+        run_id: String,
+        #[serde(default)]
+        after: i64,
+        #[serde(default = "default_page_limit")]
+        limit: u32,
+    },
     List {
         session_id: Option<String>,
         status: Option<String>,

@@ -44,6 +44,17 @@ enum Command {
     Ping,
     /// Show the daemon's effective workspace permissions and provider destination.
     Scope,
+    /// Inspect recorded workspace calls without file contents; continue from next_after.
+    Tools {
+        #[arg(long)]
+        run: String,
+        #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
+        after: i64,
+        #[arg(long, default_value_t = protocol::default_page_limit(), value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: u32,
+        #[arg(long, value_enum, default_value = "json")]
+        output: JsonOutput,
+    },
     /// Discover runs in submission order; continue from next_after.
     List {
         #[arg(long)]
@@ -160,6 +171,16 @@ pub async fn run(args: Cli) -> anyhow::Result<()> {
         }
         Command::Ping => (Operation::Ping, false),
         Command::Scope => (Operation::Scope, false),
+        Command::Tools {
+            run, after, limit, ..
+        } => (
+            Operation::Tools {
+                run_id: run,
+                after,
+                limit,
+            },
+            false,
+        ),
         Command::List {
             session,
             status,

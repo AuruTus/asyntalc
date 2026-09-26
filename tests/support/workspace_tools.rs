@@ -66,6 +66,14 @@ fn workspace_read_parent_resume_and_next_run_preserve_ordered_history() {
     let read_result: Value =
         serde_json::from_str(messages[2]["content"].as_str().unwrap()).unwrap();
     assert_eq!(read_result["ok"], true);
+    let page = daemon.rpc(json!({"op":"tools","run_id":run,"limit":1}));
+    assert_eq!(page["tools"][0]["name"], "workspace_read_file");
+    assert_eq!(page["tools"][0]["bytes"], "workspace history marker".len());
+    assert_eq!(page["tools"][0]["sha256"], read_result["sha256"]);
+    assert_eq!(page["tools"][0]["truncated"], false);
+    assert!(!page.to_string().contains("workspace history marker"));
+    assert_eq!(page["next_after"], 1);
+    assert_eq!(page["has_more"], false);
     assert_eq!(read_result["sha256"].as_str().unwrap().len(), 64);
     assert!(
         read_result.to_string().contains("workspace history marker"),
@@ -78,6 +86,8 @@ fn workspace_read_parent_resume_and_next_run_preserve_ordered_history() {
     let paused = wait(&daemon, &run);
     assert_eq!(paused["status"], "waiting_for_parent");
     restart_chat(&mut daemon);
+    let restored = daemon.rpc(json!({"op":"tools","run_id":run}));
+    assert_eq!(restored["tools"], page["tools"]);
     assert_eq!(
         wait(&daemon, &run)["input_request"],
         paused["input_request"]
@@ -176,6 +186,30 @@ fn denied_paths_return_tool_errors_and_list_search_continue() {
     let done = wait(&daemon, &run);
     assert_eq!(done["status"], "completed", "{done}");
     assert_eq!(done["usage"]["model_requests"], 5);
+    let first = daemon.rpc(json!({"op":"tools","run_id":run,"limit":2}));
+    assert_eq!(first["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["tools"][0]["path"], Value::Null);
+    assert_eq!(first["tools"][0]["error_code"], "invalid_path");
+    assert_eq!(first["tools"][1]["path"], ".env");
+    assert_eq!(first["tools"][1]["error_code"], "path_excluded");
+    let second =
+        daemon.rpc(json!({"op":"tools","run_id":run,"after":first["next_after"],"limit":2}));
+    assert_eq!(second["has_more"], false);
+    assert_eq!(second["tools"][0]["returned_entries"], 1);
+    assert_eq!(
+        second["tools"][1]["scanned_bytes"],
+        "find this literal\n".len()
+    );
+    assert!(!second.to_string().contains("literal"));
+    let output = cli(
+        daemon.dir.path(),
+        &["tools", "--run", &run, "--after", "4", "--limit", "1"],
+    );
+    assert!(output.status.success());
+    let empty: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(empty["tools"], json!([]));
+    assert_eq!(empty["next_after"], 4);
 }
 
 #[test]

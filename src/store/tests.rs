@@ -7,6 +7,33 @@ fn setup() -> (tempfile::TempDir, Store) {
 }
 
 #[tokio::test]
+async fn tool_inspection_bounds_paths_and_excludes_payloads() {
+    let (_dir, store) = setup();
+    let run = submit(&store, "tools").await;
+    let id = run.clone();
+    store.call(move |conn| {
+        let tx = conn.transaction()?;
+        for turn in 1..=100 {
+            let assistant = json!({"tool_calls":[{"function":{"name":"workspace_search","arguments":json!({"path":"\u{0001}".repeat(1025),"query":"private-query-marker"}).to_string()}}]});
+            let result = json!({"ok":true,"truncated":true,"entries":[{"path":"private-result-marker"}],"scanned_bytes":123});
+            tx.execute("INSERT INTO tool_exchanges VALUES (?1,?2,?3,?4,?5)", params![id,turn,format!("call_{turn}"),assistant.to_string(),result.to_string()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }).await.unwrap();
+    let page = store.tools(run, 0, 100).await.unwrap();
+    assert_eq!(page["tools"].as_array().unwrap().len(), 100);
+    assert_eq!(page["tools"][0]["path_truncated"], true);
+    assert_eq!(page["tools"][0]["path"].as_str().unwrap().len(), 1024);
+    assert_eq!(page["tools"][0]["truncated"], true);
+    assert_eq!(page["next_after"], 100);
+    let encoded = page.to_string();
+    assert!(encoded.len() < crate::protocol::MAX_FRAME - 1024);
+    assert!(!encoded.contains("private-query-marker"));
+    assert!(!encoded.contains("private-result-marker"));
+}
+
+#[tokio::test]
 async fn last_store_owner_closes_worker_before_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.sqlite3");

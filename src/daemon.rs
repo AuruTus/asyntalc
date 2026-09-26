@@ -250,6 +250,11 @@ async fn dispatch(
     match &request.operation {
         Operation::Ping => Ok(json!({"ready": true, "runner": runner_name})),
         Operation::Scope => store.scope(),
+        Operation::Tools {
+            run_id,
+            after,
+            limit,
+        } => store.tools(run_id.clone(), *after, *limit).await,
         Operation::List {
             session_id,
             status,
