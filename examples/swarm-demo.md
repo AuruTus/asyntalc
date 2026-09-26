@@ -20,11 +20,25 @@ The script prints a private `/tmp/asyntalc-swarm-*` evidence directory and stops
 - `summary.json`: run IDs, statuses, usage, effective scope, and mode.
 - `architecture.md`, `concurrency.md`, `test-coverage.md`, `synthesis.md`: individual and consolidated reviews.
 - `parent-questions.json`: questions and the parent's scripted answers.
-- `tool-evidence.json`: verified read results for each reviewer.
+- `tool-evidence.json`: verified read metadata for each reviewer, obtained through paginated `tools` calls without file contents (v0.1.6+).
 - `receipts.json`, `discovered.json`, per-review lifecycle logs, and `lifecycle-probe.json`.
 - `state/state.sqlite3`: durable conversation/tool history; temporary config contains only the key's variable name.
 
 Share `summary.json` and `synthesis.md` for review, plus any failure output. No key value is printed or written by the script. On failure, inspect the printed evidence directory; do not repeatedly rerun a billable failure without examining it.
+
+To inspect a retained run interactively, restart its daemon in one terminal (replace `EVIDENCE_DIR` with the printed absolute path; export the configured key):
+
+```bash
+target/debug/asyntalc --data-dir EVIDENCE_DIR/state daemon --config EVIDENCE_DIR/provider.toml
+```
+
+Then use the same directory in another terminal, replacing `RUN_ID` with a reviewer ID from `summary.json`:
+
+```bash
+target/debug/asyntalc --data-dir EVIDENCE_DIR/state tools --run RUN_ID --limit 20
+```
+
+The synthesis run normally has no workspace calls and returns an empty page. The CLI requires a running daemon; the run ID alone does not locate its database. Reading saved JSON files needs no daemon. The demo does not query SQLite directly for tool evidence in v0.1.6+.
 
 ## Local validation
 

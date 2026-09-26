@@ -1,10 +1,10 @@
 # Asyntalc prototype plan
 
-Status: Milestones 1–6 implemented. Version 0.1.5, updated 2026-09-25. Validation evidence for the newest slice is recorded in section 16.
+Status: Milestones 1–7 implemented. Version 0.1.6, updated 2026-09-26. Current tool-inspection behavior and validation are in section 18.
 Based on [the v0.1 design](asyntalc-design-v0.1.md).
 Provider decision: an OpenAI-compatible Chat Completions API, with configurable endpoint and model.
 
-**Current verdict:** version 0.1.5 adds read-only workspace tools and rejects new work on occupied sessions. See [section 16](#16-milestone-6-read-only-workspace-and-session-admission) for the architecture and usage. The CLI follows the v0.1 async contract: commit a receipt, inspect or wait, resume a parent question, and retrieve a durable result. File mutation, shell execution, sandbox isolation, and retention remain outside this prototype. Sections 10–15 preserve earlier milestone exhibitions, including the previous same-session queuing policy.
+**Current verdict:** version 0.1.6 adds bounded inspection of workspace call metadata through `tools`. The parent-managed swarm has live DeepSeek evidence, and the demo now uses CLI inspection instead of querying SQLite. The CLI follows the v0.1 async contract: commit a receipt, inspect or wait, resume a parent question, and retrieve a durable result. File mutation, shell execution, sandbox isolation, and retention remain outside this prototype. Earlier sections preserve historical milestone exhibitions, including the previous same-session queuing policy.
 
 Sections 1–9 describe the original target prototype. The provider adapter and concurrent scheduler are implemented; section 16 supersedes earlier session-admission and workspace assumptions.
 
@@ -895,3 +895,13 @@ python3 examples/swarm-demo.py --config examples/deepseek.toml
 The user-run live exhibition passed with `deepseek-flash`: four completed sessions, three parent question/resume cycles, nine verified file reads, and 16 model requests. Aggregate usage was 17,932 input and 2,927 output tokens. Saved lifecycle events show the three initial request attempts starting within 10 ms before any response was recorded. Busy-session rejection and queued/active cancellation are checked separately using a fake daemon, without API charges.
 
 This validates the practical CLI coordination workflow for a small parent-managed swarm. It does not certify generated review quality: the synthesis identified the intended lost-update race but also repeated an unsupported arithmetic claim and imprecise source references. The parent must assess evidence before acting on findings. See the [live swarm record](../knowledge-base/deepseek-swarm-live-validation.md) for verification, the earlier unsuccessful attempt, and remaining scope. Next proposed work is bounded CLI inspection of tool names, paths, outcomes, and truncation without exposing file contents in lifecycle logs.
+
+## 18. Milestone 7: tool inspection
+
+Version 0.1.6, schema 5, protocol 1. `asyntalc --data-dir PATH tools --run RUN_ID --limit 20` returns finite metadata pages over existing `tool_exchanges`. The CLI sends a read-only `tools` operation; the database worker projects scalar metadata rather than returning stored content. No migration, new API call, or execution slot is needed.
+
+The envelope contains `run_id`, `tools`, `next_after`, and `has_more`. Model turn is the exclusive cursor (`--after`, default 0). Pages default to 50 and permit 1–100 records. Records expose the tool name/call ID, bounded relative path preview, success/error, file byte count/hash, and available list/search counts/truncation. Missing fields are null; `path_truncated` describes the path preview only. Path previews stop at 1024 UTF-8 bytes, preserving character boundaries. Invalid paths are null. Parent questions, raw arguments, search queries, file contents, matched entries, and rejected/uncommitted calls are absent.
+
+The saved successful DeepSeek architecture run was inspected through the new CLI on a temporary database copy. A two-item first page and one-item continuation returned model turns 2, 3, and 4, paths `README.md`, `counter.py`, and `test_counter.py`, byte counts 172/206/164, and SHA-256 hashes. The synthesis run returned an empty page. No new live model request was necessary for this inspection feature.
+
+Validation: 23 unit and 40 integration tests passed, two billable tests ignored; formatting, Clippy with warnings denied, and locked offline build passed. Coverage includes in-progress and restarted runs, errors, pagination and empty cursors, query/content omission, and a 100-record page with heavily escaped long paths below the socket-frame limit. The Python mock swarm also passed after replacing direct SQLite reads with paginated CLI calls. See [the handoff](../knowledge-base/milestone-7-tool-inspection.md) for implementation details and remaining limits.

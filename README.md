@@ -2,7 +2,7 @@
 
 A Rust prototype of a durable local executor for asynchronous subagent tasks.
 
-**Version 0.1.5: read-only workspace tools and one unfinished run per session.** Independent sessions run concurrently with a configurable global limit. The CLI supports cancellation, durable deadlines, safe retries, parent clarification, and run/event inspection. An opt-in workspace lets the model read, list, and search files beneath an explicit root. File mutation and shell execution remain future work.
+**Version 0.1.6: workspace tool inspection.** `tools` exposes paginated call metadata without file contents. Independent sessions run concurrently with one unfinished run per session. The CLI supports cancellation, durable deadlines, safe retries, parent clarification, and run/event inspection. An opt-in workspace lets the model read, list, and search files beneath an explicit root. File mutation and shell execution remain future work.
 
 See the [design](docs/asyntalc-design-v0.1.md), [prototype plan](docs/asyntalc-prototype-plan.md), and [milestone 6 handoff](knowledge-base/milestone-6-workspace-tools.md).
 
@@ -214,6 +214,24 @@ The model can call `workspace_read_file`, `workspace_list_files`, and `workspace
 
 This Linux implementation requires `openat2` and `/proc/self/fd`. Access is rooted in an open directory descriptor; traversal, symlinks, mount crossings below the root, and non-regular file reads are rejected. Use a trusted local filesystem: bounded bytes and traversal do not guarantee a deadline for a stalled filesystem. This is a read-only tool boundary, not an OS sandbox for arbitrary programs.
 
+## Inspect workspace calls
+
+Use the data directory belonging to the run and keep its daemon running:
+
+```bash
+target/debug/asyntalc --data-dir PATH tools --run RUN_ID --limit 20
+# Continue with next_after from the previous page.
+target/debug/asyntalc --data-dir PATH tools --run RUN_ID --after 3 --limit 20
+```
+
+Replace `PATH` and `RUN_ID` with real values. The swarm demo stops its daemon on exit; restart it with the generated configuration to inspect its data, as described in the [demo instructions](examples/swarm-demo.md).
+
+The response contains `run_id`, `tools`, `next_after`, and `has_more`. Each workspace record includes `model_turn`, `call_id`, `name`, relative `path`, `path_truncated`, `ok`, and `error_code`. Optional fields are `bytes` and `sha256` for a file read, or `returned_entries`, `visited`, `scanned_bytes`, `skipped`, and `truncated` for list/search. Unavailable fields are null. A successful file read has `truncated: false`; oversized reads fail rather than return partial contents.
+
+Pages contain 1–100 entries (default 50), ordered by model turn. `--after` is an exclusive nonnegative cursor; gaps are normal because parent questions and final answers also consume turns. Empty pages preserve the incoming cursor. Unknown runs return `run_not_found`. Paths exceeding 1024 UTF-8 bytes are previewed with `path_truncated: true`; malformed, absolute, or traversal paths are omitted as null. Tool-result truncation is a separate field.
+
+Only persisted workspace exchanges appear, including tool errors and exchanges in subsequently failed/cancelled runs. Parent questions, rejected provider responses, and in-flight/uncommitted calls do not appear. Use `status` and `logs` for those lifecycle states. File contents, search queries, matched entries/lines, assistant text, and full arguments are excluded. Existing schema-5 records work without migration.
+
 ## Validation
 
 For a parent-managed three-reviewer workflow and synthesis, see the [swarm demo](examples/swarm-demo.md). It includes a runnable live script and no-API rehearsals.
@@ -248,6 +266,8 @@ cargo test --locked --test client_daemon \
 It uses generated temporary files, enables read/list/search and parent questions, and expects six billable model requests. It copies endpoint/model/credential-variable and adapter settings from the selected profile, while replacing workspace, instructions, timeouts, and output limits for the test. It never exposes the repository as its workspace. The successful follow-up must reproduce the answer from history after the fixture file has been deleted. Both live tests are ignored by default.
 
 Version 0.1.5 validation on Rust/Cargo 1.98.1: **61 local tests passed**. Formatting, the locked all-target build, and Clippy passed. The suite also runs the Bash/Python inspection demo. The user subsequently ran the workspace smoke test against DeepSeek successfully: six model requests, including parent resume and follow-up history. See the [live validation evidence](knowledge-base/deepseek-workspace-live-validation.md) for the results and limits.
+
+Version 0.1.6: **63 local tests passed**, two billable tests ignored; formatting, Clippy, and the locked build passed. The Python mock swarm passed with CLI-only tool inspection. Pagination was also checked against a temporary copy of the saved successful DeepSeek swarm database, with no new provider requests.
 
 Repeated validation exposed a database close/reopen deadlock: reopening could race the previous worker's SQLite destructor. Final store cleanup now joins that worker before reopening or releasing daemon ownership. A 32-cycle regression and repeated parallel unit runs pass; the [handoff](knowledge-base/milestone-6-workspace-tools.md) records the debugger evidence.
 

@@ -1,0 +1,13 @@
+# Milestone 7: tool inspection
+
+Version 0.1.6, schema 5, wire protocol 1. Implements the previously proposed `tools --run ID --after N --limit N --output json` command. A running daemon and the correct data directory are required. The operation is read-only and works with existing workspace exchanges, including failed runs, without replaying provider requests.
+
+Implementation: CLI → `Operation::Tools` → daemon dispatch → `Store::tools` in `src/store/inspection.rs`. SQL projects tool identity, arguments for path extraction only, and result scalars; it does not select result content or matched-entry payloads. Rust emits an explicit allowlist of metadata. Invalid paths are null; valid paths are previewed at 1024 UTF-8 bytes with a flag, bounding heavily escaped pages beneath the 1 MiB wire frame. Search queries and full arguments never enter the response.
+
+Cursor is exclusive model turn, not event sequence or row count. Questions/final answers produce gaps. Limit 1–100, default50; fetch limit+1 for `has_more`, preserve cursor on empty pages. Unknown run/page errors match existing inspection conventions. Hash and byte count apply to direct reads; list/search expose aggregate counts without matching paths or per-match hashes. `truncated` is tool-result truncation, separate from `path_truncated`. Missing metadata is null; a successful full-file read reports false truncation.
+
+Only persisted workspace exchanges appear. `ask_parent`, rejected provider calls, and operations discarded because cancellation won are not included. Do not mistake absence for proof no request was attempted; consult status and lifecycle logs. No detailed error payload or provider response is newly persisted.
+
+Tests: 23 unit +40 integration passed, two live tests ignored. Formatting, Clippy, and locked offline build passed. Python mock swarm passed after switching its inspection from direct SQLite to `tools` pages. A temporary copy of `/tmp/asyntalc-swarm-ga3c6q41/state/state.sqlite3` was served by a fake daemon solely for inspecting terminal historical runs: architecture paginated2+1 with correct paths/hashes/byte counts; synthesis empty. Original evidence was unchanged and no API request was made. Sandbox socket restrictions required running integration/mock checks with permission for local sockets.
+
+The live demonstration and this inspection slice are complete. Next design work can address workspace mutation/process isolation or richer diagnostics for rejected provider responses; these require separate contracts. Current prototype remains read-only, one unfinished run per session, with no application-level MVCC.
