@@ -402,9 +402,17 @@ fn parse_workspace_call(
             "Provider returned an invalid workspace tool call",
         )
     };
-    let calls = message.tool_calls.ok_or_else(invalid)?;
+    let calls = message.tool_calls.ok_or_else(|| {
+        Failure::new(
+            "invalid_tool_call",
+            "Provider omitted tool_calls for a tool_calls response",
+        )
+    })?;
     if calls.len() != 1 {
-        return Err(invalid());
+        return Err(Failure::new(
+            "invalid_tool_call",
+            "Expected exactly one workspace tool call per response; provider returned zero or multiple calls",
+        ));
     }
     let call = &calls[0];
     let id = call["id"].as_str().ok_or_else(invalid)?;
@@ -578,6 +586,15 @@ mod tests {
             error_code(&response(vec![valid.clone(), valid.clone()]), Some(&config)),
             "invalid_tool_call"
         );
+        match parse_completion(
+            &response(vec![valid.clone(), valid.clone()]),
+            1024,
+            false,
+            Some(&config),
+        ) {
+            Err(failure) => assert!(failure.message.contains("zero or multiple calls")),
+            Ok(_) => panic!("batched workspace calls must be rejected"),
+        }
         let mut bad_id = valid;
         bad_id["id"] = json!("bad/id");
         assert_eq!(

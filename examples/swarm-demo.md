@@ -36,4 +36,6 @@ python3 examples/swarm-demo.py --fake
 python3 tests/swarm_demo_test.py
 ```
 
-Both passed during preparation. The mock test verifies 16 requests, three parent interactions, and three sets of file-read evidence. These commands require local Unix/TCP sockets. The fake mode produces echoed prompts, not actual reviews. The live swarm demonstration is prepared for the user to run; no live swarm result has been recorded yet.
+Both passed during preparation. The mock test verifies 16 requests, three parent interactions, and three sets of file-read evidence. These commands require local Unix/TCP sockets. The fake mode produces echoed prompts, not actual reviews.
+
+The first user-run live attempt reached all three parent questions, but architecture failed on its second model response with `invalid_tool_call`, before any workspace exchange was persisted. Cleanup cancelled the other reviewers. The rejected response was not retained, so batched calls are a hypothesis, not a confirmed cause. The prompt now explicitly reads one file per response, waiting for each result; the parser distinguishes missing/zero/multiple calls from malformed call fields, and failed runs retain their lifecycle logs. Rebuild before rerunning. A successful live swarm run remains pending.

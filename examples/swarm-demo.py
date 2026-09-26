@@ -143,11 +143,11 @@ def collect(client, runs, evidence, answer, fake):
                     client.call("resume", "--run", run, "--question", question["question_id"],
                                 "--input", "-", input=answer)
                 elif snapshot["status"] in TERMINAL:
+                    save(evidence / f"{name}-logs.json", client.call("logs", "--run", run, "--limit", "100"))
                     require(snapshot["status"] == "completed", f"{name} stopped: {snapshot}")
                     result = client.call("result", "--run", run)
                     save(evidence / f"{name}-result.json", result)
                     (evidence / f"{name}.md").write_text(result["result"]["text"])
-                    save(evidence / f"{name}-logs.json", client.call("logs", "--run", run, "--limit", "100"))
                     if not fake and name != "synthesis":
                         require(any(q["reviewer"] == name for q in questions),
                                 f"{name} skipped the requested parent clarification")
@@ -194,7 +194,10 @@ def main():
         receipts = {}
         for role in ["architecture", "concurrency", "test-coverage"]:
             prompt = (f"You are the {role} reviewer of a tiny counter service. First call ask_parent once to ask which review priority to use. "
-                      "After receiving the answer, read README.md, counter.py and test_counter.py with workspace_read_file. "
+                      "After receiving the answer, follow this sequential protocol: first call workspace_read_file for README.md only. "
+                      "Wait for that tool result, then call workspace_read_file for counter.py only. "
+                      "Wait for that tool result, then call workspace_read_file for test_counter.py only. "
+                      "Each assistant response must contain at most one tool call. Never batch file reads or issue parallel tool calls. "
                       f"Give at most three concrete findings from the {role} perspective, each with file and line references and a suggested fix. "
                       "Do not execute code or modify files. Finish after reviewing these three files.")
             receipts[role] = client.submit(role, prompt)
