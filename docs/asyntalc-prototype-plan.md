@@ -881,3 +881,17 @@ The user ran the opt-in `chat_provider::live_workspace::live_workspace_smoke` te
 The successful test used six model requests: five for the tool/parent workflow and one for the history follow-up. Reported totals were 6,824 input tokens and 267 output tokens; the test completed in 4.43 seconds. This is one compatibility observation, not a latency or reliability benchmark. The first attempt had reached final completion but failed exact output formatting because the model included a literal placeholder tag. An unambiguous concatenation instruction fixed the observed test outcome without weakening assertions or changing the provider adapter.
 
 See [the live validation record](../knowledge-base/deepseek-workspace-live-validation.md) for the command, evidence, and limits. Live restart recovery, thinking mode, concurrent swarm execution, and file mutation were not tested by this smoke run.
+
+## 17. Parent-managed swarm exhibition
+
+The [swarm demo](../examples/swarm-demo.md) creates an isolated counter-service fixture and submits architecture, concurrency, and test-coverage sessions to a daemon with three active slots. The Python parent rediscovers run IDs, answers clarification questions with a configured priority, retrieves each review, and submits them to a fourth synthesis session. The framework executes the work; the parent script owns decomposition, dependencies, and synthesis scheduling.
+
+```bash
+cargo build --locked
+# Export the configured API key in this shell through your usual mechanism.
+python3 examples/swarm-demo.py --config examples/deepseek.toml
+```
+
+The user-run live exhibition passed with `deepseek-flash`: four completed sessions, three parent question/resume cycles, nine verified file reads, and 16 model requests. Aggregate usage was 17,932 input and 2,927 output tokens. Saved lifecycle events show the three initial request attempts starting within 10 ms before any response was recorded. Busy-session rejection and queued/active cancellation are checked separately using a fake daemon, without API charges.
+
+This validates the practical CLI coordination workflow for a small parent-managed swarm. It does not certify generated review quality: the synthesis identified the intended lost-update race but also repeated an unsupported arithmetic claim and imprecise source references. The parent must assess evidence before acting on findings. See the [live swarm record](../knowledge-base/deepseek-swarm-live-validation.md) for verification, the earlier unsuccessful attempt, and remaining scope. Next proposed work is bounded CLI inspection of tool names, paths, outcomes, and truncation without exposing file contents in lifecycle logs.
